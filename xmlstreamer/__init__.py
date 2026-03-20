@@ -8,7 +8,7 @@ import zlib
 from contextlib import closing
 from datetime import datetime
 
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import defusedxml.sax
 import chardet
@@ -44,6 +44,25 @@ USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb"\
     "Kit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.3"
 
 
+def _build_http_auth(auth) -> Optional[Any]:
+    """Returns the auth object compatible with requests, or None."""
+    if isinstance(auth, tuple):
+        if len(auth) == 3 and auth[0] == "digest":
+            return requests.auth.HTTPDigestAuth(auth[1], auth[2])
+        return auth  # Basic Auth: (user, pass) tuple
+    return None  # Bearer/API Key are managed via headers
+
+
+def _build_http_headers(user_agent: str, auth) -> dict:
+    """Builds the headers dict including the authentication header if applicable."""
+    headers = {"User-Agent": user_agent}
+    if isinstance(auth, str):
+        headers["Authorization"] = f"Bearer {auth}"
+    elif isinstance(auth, dict):
+        headers[auth["header"]] = auth["value"]
+    return headers
+
+
 def stream_gzip_decompress(stream: bytes) -> Generator:
     """
     Decompressing GZIP from a stream of bytes.
@@ -60,7 +79,9 @@ def stream_gzip_decompress(stream: bytes) -> Generator:
 
 def download_file(
     url: str,
-    user_agent: str
+    user_agent: str,
+    auth: Optional[Any] = None,
+    proxy: Optional[Dict[str, str]] = None,
         ) -> BufferedRandom:
     """
     Download file to temporary file.
@@ -70,12 +91,26 @@ def download_file(
 
     parsed_url = urlparse(url)
     if parsed_url.scheme == "ftp":
-        with closing(urllib.request.urlopen(url)) as r:
+        if isinstance(auth, tuple):
+            user, password = (auth[1], auth[2]) if auth[0] == "digest" else (auth[0], auth[1])
+            ftp_url = urlunparse(parsed_url._replace(
+                netloc=f"{user}:{password}@{parsed_url.hostname}"
+                + (f":{parsed_url.port}" if parsed_url.port else "")
+            ))
+        else:
+            ftp_url = url
+        if proxy:
+            proxy_handler = urllib.request.ProxyHandler(proxy)
+            opener = urllib.request.build_opener(proxy_handler)
+        else:
+            opener = urllib.request.build_opener()
+        with closing(opener.open(ftp_url)) as r:
             shutil.copyfileobj(r, f)
 
     elif parsed_url.scheme in ["http", "https"]:
-        headers = {"User-Agent": user_agent}
-        with requests.get(url, stream=True, headers=headers) as r:
+        headers = _build_http_headers(user_agent, auth)
+        http_auth = _build_http_auth(auth)
+        with requests.get(url, stream=True, headers=headers, auth=http_auth, proxies=proxy) as r:
             r.raise_for_status()
             r.raw.decode_content = True
             shutil.copyfileobj(r.raw, f)
@@ -106,10 +141,9 @@ def decode_stream(generator, encoding):
             yield decoded_chunk.encode("utf-8")
             buffer = b""
         except UnicodeDecodeError:
-            # Se mantiene el buffer para el siguiente
-            # # ciclo en caso de datos incompletos
+            # Keep buffer for next cycle in case of incomplete data
             ...
-    # Decodificar cualquier resto de datos después del último chunk.
+    # Decode any remaining data after the last chunk.
     yield decoder.decode(buffer, final=True).encode("utf-8")
 
 
@@ -140,11 +174,15 @@ def buffered_random_to_generator(
 
 def get_feed_generator(
     url: str,
-    user_agent: str
+    user_agent: str,
+    auth: Optional[Any] = None,
+    proxy: Optional[Dict[str, str]] = None,
         ) -> FeedGeneratorT:
     temp_file: BufferedRandom = download_file(
         url=url,
-        user_agent=user_agent
+        user_agent=user_agent,
+        auth=auth,
+        proxy=proxy,
     )
     temp_file.seek(0)
 
@@ -421,6 +459,8 @@ class StreamInterpreter:
         buffer_size: int = 1024 * 128,  # 128Kb
         max_running_time: Optional[int] = None,
         user_agent: str = USER_AGENT,
+        auth: Optional[Any] = None,
+        proxy: Optional[Dict[str, str]] = None,
             ):
         self.BUFFER_SIZE = buffer_size
         self.URL: str = url
@@ -429,6 +469,8 @@ class StreamInterpreter:
         self.MAX_RUNNING_TIME = max_running_time
 
         self.USER_AGENT = user_agent
+        self.AUTH = auth
+        self.PROXY = proxy
 
         # Internal.
         self.ITEM_FILTER = item_filter
@@ -445,7 +487,9 @@ class StreamInterpreter:
         self.tokenizer = Tokenizer(
             feed_generator=get_feed_generator(
                 url=self.URL,
-                user_agent=self.USER_AGENT
+                user_agent=self.USER_AGENT,
+                auth=self.AUTH,
+                proxy=self.PROXY,
             ),
             separator_tag=self.separator_tag,
             buffer_size=1024 * 128
