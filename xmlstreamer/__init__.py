@@ -44,22 +44,48 @@ USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb"\
     "Kit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.3"
 
 
-def _build_http_auth(auth) -> Optional[Any]:
+@attrs.define()
+class BasicAuth:
+    username: str = attrs.field()
+    password: str = attrs.field()
+
+
+@attrs.define()
+class DigestAuth:
+    username: str = attrs.field()
+    password: str = attrs.field()
+
+
+@attrs.define()
+class BearerAuth:
+    token: str = attrs.field()
+
+
+@attrs.define()
+class ApiKeyAuth:
+    header: str = attrs.field()
+    value: str = attrs.field()
+
+
+AuthT = Optional[Any]
+
+
+def _build_http_auth(auth: AuthT) -> Optional[Any]:
     """Returns the auth object compatible with requests, or None."""
-    if isinstance(auth, tuple):
-        if len(auth) == 3 and auth[0] == "digest":
-            return requests.auth.HTTPDigestAuth(auth[1], auth[2])
-        return auth  # Basic Auth: (user, pass) tuple
-    return None  # Bearer/API Key are managed via headers
+    if isinstance(auth, BasicAuth):
+        return (auth.username, auth.password)
+    if isinstance(auth, DigestAuth):
+        return requests.auth.HTTPDigestAuth(auth.username, auth.password)
+    return None
 
 
-def _build_http_headers(user_agent: str, auth) -> dict:
+def _build_http_headers(user_agent: str, auth: AuthT) -> dict:
     """Builds the headers dict including the authentication header if applicable."""
     headers = {"User-Agent": user_agent}
-    if isinstance(auth, str):
-        headers["Authorization"] = f"Bearer {auth}"
-    elif isinstance(auth, dict):
-        headers[auth["header"]] = auth["value"]
+    if isinstance(auth, BearerAuth):
+        headers["Authorization"] = f"Bearer {auth.token}"
+    elif isinstance(auth, ApiKeyAuth):
+        headers[auth.header] = auth.value
     return headers
 
 
@@ -91,10 +117,9 @@ def download_file(
 
     parsed_url = urlparse(url)
     if parsed_url.scheme == "ftp":
-        if isinstance(auth, tuple):
-            user, password = (auth[1], auth[2]) if auth[0] == "digest" else (auth[0], auth[1])
+        if isinstance(auth, (BasicAuth, DigestAuth)):
             ftp_url = urlunparse(parsed_url._replace(
-                netloc=f"{user}:{password}@{parsed_url.hostname}"
+                netloc=f"{auth.username}:{auth.password}@{parsed_url.hostname}"
                 + (f":{parsed_url.port}" if parsed_url.port else "")
             ))
         else:
