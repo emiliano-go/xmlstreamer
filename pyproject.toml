@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xmlstreamer"
-version = "1.2.1"
-description = "Python library to parse XML data directly from HTTP, HTTPS, or FTP sources without loading the entire file into memory, supporting decompression, encoding detection, tag-based itemization, and optional filtering."
+dynamic = ["version"]
+description = "Stream large or malformed XML feeds from HTTP, HTTPS or FTP without loading them into memory."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -14,25 +14,54 @@ authors = [
   { name = "Carlos A. Planchón", email = "carlosandresplanchonprestes@gmail.com" }
 ]
 classifiers = [
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Topic :: Software Development :: Libraries",
+  "Topic :: Text Processing :: Markup :: XML",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13"
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14"
 ]
 keywords = ["xml", "streaming", "parser", "lightweight", "http", "https", "ftp"]
 dependencies = [
-  "defusedxml==0.7.1",
-  "chardet==5.2.0",
-  "requests==2.28.0",
-  "attrs==23.2.0",
-  "attrs-strict==1.0.1"
+  "chardet>=5.2",
+  "requests>=2.32"
 ]
 
+[project.scripts]
+xmlstreamer = "xmlstreamer.__main__:main"
+
 [project.urls]
-repository = "https://github.com/carlosplanchon/xmlstreamer.git"
+Homepage = "https://github.com/carlosplanchon/xmlstreamer"
+Repository = "https://github.com/carlosplanchon/xmlstreamer"
+Issues = "https://github.com/carlosplanchon/xmlstreamer/issues"
+
+[dependency-groups]
+bench = [
+    "lxml>=6.1.1",
+    "xmltodict>=1.0.4",
+]
+dev = [
+  "hypothesis>=6.164.0",
+  "pytest>=8",
+]
+
+# The dynamic version lives in the module: rebuild the editable install
+# when that file changes, not only on pyproject changes (uv's default).
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "xmlstreamer/__init__.py" }
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "xmlstreamer.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["xmlstreamer*"]
+
+[tool.setuptools.package-data]
+xmlstreamer = ["py.typed"]

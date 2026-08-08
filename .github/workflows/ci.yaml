@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the supported range (requires-python >=3.10).
+        python-version: ["3.10", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Run test suite (Python ${{ matrix.python-version }})
+        run: uv run --python ${{ matrix.python-version }} pytest tests/ -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Ruff (unused imports and variables)
+        run: uvx ruff check --select F401,F811,F841 xmlstreamer/ tests/
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # The release workflow builds the same way: a packaging mistake
+      # (a missing file, a version that will not resolve) surfaces on
+      # every push instead of on the tag that was meant to ship.
+      - name: Smoke test the wheel
+        run: >
+          uv run --isolated --no-project --with dist/*.whl
+          python -c "import xmlstreamer; print(xmlstreamer.__version__)"
+
+      - name: Smoke test the source distribution
+        run: >
+          uv run --isolated --no-project --with dist/*.tar.gz
+          python -c "import xmlstreamer; print(xmlstreamer.__version__)"
+
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      # Smoke only: shared runners make timing numbers meaningless, so
+      # this proves the harness runs end to end, never asserts speed.
+      - name: Benchmark harness smoke run
+        run: uv run --group bench python benchmarks/run_all.py --quick
