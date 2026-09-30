@@ -28,6 +28,17 @@ class XmlAdapter:
         batch_size: Optional[int] = None,
         **kwargs: Any,
     ) -> Iterator[pa.RecordBatch]:
+        threads = kwargs.pop("threads", None)
+        ordered = kwargs.pop("ordered", True)
+        if threads and threads > 1:
+            yield from _xmlstreamer.iter_xml_batches_par(
+                str(path),
+                threads=threads,
+                memory=memory,
+                ordered=ordered,
+                **kwargs,
+            )
+            return
         yield from _xmlstreamer.read_xml_stream(
             str(path), memory=memory, **kwargs
         )

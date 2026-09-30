@@ -49,9 +49,24 @@ class XmlSource(Adapter):
         batch_size: Optional[int] = None,
         **plan_overrides: Any,
     ) -> Iterator[pa.RecordBatch]:
+        # Parallel streaming is the default when threads are requested; it
+        # preserves file order and bounds parser memory. Without threads the
+        # sequential bounded path is used.
+        threads = plan_overrides.pop("threads", None)
+        ordered = plan_overrides.pop("ordered", True)
         plan = self._build_plan_kwargs()
         if plan_overrides:
             plan.update(plan_overrides)
+        if threads and threads > 1:
+            yield from _xmlstreamer.iter_xml_batches_par(
+                str(self._path),
+                separator_tag=self._separator_tag,
+                threads=threads,
+                memory=memory,
+                ordered=ordered,
+                **plan,
+            )
+            return
         yield from _xmlstreamer.read_xml_stream(
             str(self._path),
             separator_tag=self._separator_tag,

@@ -85,6 +85,24 @@ def _stream(memory: str) -> Callable[[str], int]:
     return run
 
 
+def _par_stream(threads: int, memory: str = "64MiB") -> Callable[[str], int]:
+    def run(path: str) -> int:
+        from xmlstreamer import _xmlstreamer
+
+        return sum(
+            b.num_rows
+            for b in _xmlstreamer.iter_xml_batches_par(
+                path,
+                separator_tag="item",
+                threads=threads,
+                memory=memory,
+                use_mmap=True,
+            )
+        )
+
+    return run
+
+
 def _projection(path: str) -> int:
     from xmlstreamer import _xmlstreamer
 
@@ -103,6 +121,7 @@ ENGINES: Dict[str, Callable] = {
     "rypipe par8": _parallel(8),
     "rypipe par12": _parallel(12),
     "rypipe stream64": _stream("64MiB"),
+    "rypipe par-stream8": _par_stream(8),
     "rypipe columnar drop4": _projection,
 }
 

@@ -166,6 +166,40 @@ def test_source_streaming_iter_record_batches(tmp_path):
     assert total == 2000
 
 
+def test_parallel_streaming_preserves_order_and_matches(tmp_path):
+    feed = build_feed([{"n": str(i)} for i in range(5000)])
+    path = _write(tmp_path, feed)
+    expected = [{"n": str(i)} for i in range(5000)]
+
+    sequential = [
+        row
+        for batch in _xmlstreamer.read_xml_stream(
+            path, separator_tag="item", memory="64KiB"
+        )
+        for row in batch.to_pylist()
+    ]
+    parallel = [
+        row
+        for batch in _xmlstreamer.iter_xml_batches_par(
+            path, separator_tag="item", threads=4, memory="1MiB"
+        )
+        for row in batch.to_pylist()
+    ]
+    assert sequential == expected
+    assert parallel == expected
+
+
+def test_source_parallel_streaming_via_iter_record_batches(tmp_path):
+    feed = build_feed([{"n": str(i)} for i in range(2000)])
+    source = XmlSource(_write(tmp_path, feed), separator_tag="item")
+    rows = [
+        row
+        for batch in source.iter_record_batches(memory="1MiB", threads=4)
+        for row in batch.to_pylist()
+    ]
+    assert rows == [{"n": str(i)} for i in range(2000)]
+
+
 def test_projection_drop_fields(tmp_path):
     feed = build_feed([{"t": "a", "n": "1"}, {"t": "b", "n": "2"}])
     table = _xmlstreamer.read_xml(

@@ -1,12 +1,13 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 
-use rypipe_core::{MemoryBudget, Pipeline};
+use rypipe_core::{MemoryBudget, ParallelStreamOpts, ParallelStreamingBatchIterator, Pipeline};
 use rypipe_python::{
-    execution_plan_from_kwargs, py_err_from_rypipe, record_batches_to_pyarrow_batches,
-    record_batches_to_pyarrow_table,
+    execution_plan_from_kwargs, py_err_from_rypipe, record_batch_to_pyarrow,
+    record_batches_to_pyarrow_batches, record_batches_to_pyarrow_table,
 };
 
 mod parser;
@@ -374,6 +375,109 @@ fn read_xml_stream(
     record_batches_to_pyarrow_batches(py, &batches).map(|list| list.unbind().into_any())
 }
 
+/// Lazy iterator over `pyarrow.RecordBatch` from the parallel streaming engine.
+///
+/// The inner iterator lives behind a `Mutex` because its worker channel is
+/// `Send` but not `Sync`, and pyclasses must be both.
+#[pyclass]
+struct ParallelBatches {
+    inner: Arc<std::sync::Mutex<ParallelStreamingBatchIterator>>,
+}
+
+#[pymethods]
+impl ParallelBatches {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        // The worker parses on other threads; release the GIL while waiting.
+        let inner = Arc::clone(&self.inner);
+        let next = py.detach(move || {
+            inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .next()
+        });
+        match next {
+            None => Ok(None),
+            Some(Ok(batch)) => {
+                Ok(Some(record_batch_to_pyarrow(py, &batch)?.unbind()))
+            }
+            Some(Err(err)) => Err(py_err_from_rypipe(err)),
+        }
+    }
+}
+
+/// Parallel streaming read: yields batches as the workers produce them,
+/// in file order when `ordered` is true.
+#[pyfunction]
+#[pyo3(signature = (path, separator_tag="item".to_string(), threads=8, memory=None,
+    ordered=true, field_mapping=None, drop_fields=None, filter=None, field_types=None,
+    dictionary_columns=None, schema=None, auto_dict=false, auto_dict_threshold=None,
+    auto_dict_max_size=None, strict_types=false, max_split_chunks=None, observer=None,
+    use_mmap=true, prefault=false))]
+#[allow(clippy::too_many_arguments)]
+fn iter_xml_batches_par(
+    path: String,
+    separator_tag: String,
+    threads: usize,
+    memory: Option<Bound<'_, PyAny>>,
+    ordered: bool,
+    field_mapping: Option<HashMap<String, String>>,
+    drop_fields: Option<Vec<String>>,
+    filter: Option<Bound<'_, PyAny>>,
+    field_types: Option<HashMap<String, String>>,
+    dictionary_columns: Option<Vec<String>>,
+    schema: Option<Vec<String>>,
+    auto_dict: bool,
+    auto_dict_threshold: Option<f64>,
+    auto_dict_max_size: Option<usize>,
+    strict_types: bool,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
+    use_mmap: bool,
+    prefault: bool,
+) -> PyResult<ParallelBatches> {
+    let _ = use_mmap; // parallel streaming always maps/decompresses via InputBuffer
+    let budget = match memory {
+        Some(value) => MemoryBudget::new(memory_bytes(&value)?),
+        None => MemoryBudget::new(64 * 1024 * 1024),
+    };
+    let plan = execution_plan_from_kwargs(
+        field_mapping,
+        drop_fields,
+        filter.as_ref(),
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
+        auto_dict_threshold,
+        auto_dict_max_size,
+        strict_types,
+        max_split_chunks,
+        observer.as_ref(),
+    )?;
+    let opts = ParallelStreamOpts {
+        threads: threads.max(1),
+        ordered,
+        max_reorder: 0,
+        schema: None,
+    };
+    let inner = ParallelStreamingBatchIterator::new(
+        std::path::PathBuf::from(&path),
+        XmlSplitter::new(&separator_tag),
+        XmlParser::new(&separator_tag),
+        Arc::new(plan),
+        budget,
+        prefault,
+        opts,
+    );
+    Ok(ParallelBatches {
+        inner: Arc::new(std::sync::Mutex::new(inner)),
+    })
+}
+
 #[pymodule]
 fn _xmlstreamer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_document, m)?)?;
@@ -384,6 +488,8 @@ fn _xmlstreamer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_xml, m)?)?;
     m.add_function(wrap_pyfunction!(read_xml_par, m)?)?;
     m.add_function(wrap_pyfunction!(read_xml_stream, m)?)?;
+    m.add_function(wrap_pyfunction!(iter_xml_batches_par, m)?)?;
+    m.add_class::<ParallelBatches>()?;
     m.add_class::<Tokenizer>()?;
     Ok(())
 }
