@@ -1,10 +1,54 @@
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use std::collections::HashMap;
 
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
+
+use rypipe_core::{MemoryBudget, Pipeline};
+use rypipe_python::{
+    execution_plan_from_kwargs, py_err_from_rypipe, record_batches_to_pyarrow_batches,
+    record_batches_to_pyarrow_table,
+};
+
+mod parser;
+mod scan;
+mod splitter;
 mod tokenizer;
 mod xml;
 
+use parser::XmlParser;
+use splitter::XmlSplitter;
 use tokenizer::{Log, Next};
+
+/// Parse a memory string ("64MiB", "1GB") or an int into bytes.
+fn memory_bytes(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if let Ok(bytes) = value.extract::<usize>() {
+        return Ok(bytes.max(1));
+    }
+    let text: String = value.extract()?;
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let (num, unit) = text.split_at(split);
+    let num: f64 = num
+        .parse()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid memory value"))?;
+    let mult: f64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1.0,
+        "KB" => 1_000.0,
+        "MB" => 1_000_000.0,
+        "GB" => 1_000_000_000.0,
+        "KIB" => 1024.0,
+        "MIB" => 1024.0 * 1024.0,
+        "GIB" => 1024.0 * 1024.0 * 1024.0,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown memory unit: {other:?}"
+            )))
+        }
+    };
+    Ok(((num * mult) as usize).max(1))
+}
 
 /// Parse a whole item document into `(flat_dict_or_None, collisions)`.
 #[pyfunction]
@@ -166,6 +210,170 @@ impl Tokenizer {
     }
 }
 
+#[pyfunction]
+#[pyo3(signature = (path, separator_tag="item".to_string(), field_mapping=None, drop_fields=None,
+    filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false,
+    auto_dict_threshold=None, auto_dict_max_size=None, strict_types=false,
+    max_split_chunks=None, observer=None, use_mmap=false, prefault=false))]
+#[allow(clippy::too_many_arguments)]
+fn read_xml(
+    py: Python<'_>,
+    path: String,
+    separator_tag: String,
+    field_mapping: Option<HashMap<String, String>>,
+    drop_fields: Option<Vec<String>>,
+    filter: Option<Bound<'_, PyAny>>,
+    field_types: Option<HashMap<String, String>>,
+    dictionary_columns: Option<Vec<String>>,
+    schema: Option<Vec<String>>,
+    auto_dict: bool,
+    auto_dict_threshold: Option<f64>,
+    auto_dict_max_size: Option<usize>,
+    strict_types: bool,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
+    use_mmap: bool,
+    prefault: bool,
+) -> PyResult<Py<PyAny>> {
+    let plan = execution_plan_from_kwargs(
+        field_mapping,
+        drop_fields,
+        filter.as_ref(),
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
+        auto_dict_threshold,
+        auto_dict_max_size,
+        strict_types,
+        max_split_chunks,
+        observer.as_ref(),
+    )?;
+    let batch = py
+        .detach(|| {
+            Pipeline::new(
+                XmlSplitter::new(&separator_tag),
+                XmlParser::new(&separator_tag),
+            )
+            .with_plan(plan)
+            .read_path(&path, use_mmap, prefault)
+        })
+        .map_err(py_err_from_rypipe)?;
+    record_batches_to_pyarrow_table(py, &[batch]).map(|table| table.unbind())
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, separator_tag="item".to_string(), chunks=4, field_mapping=None,
+    drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None,
+    auto_dict=false, auto_dict_threshold=None, auto_dict_max_size=None, strict_types=false,
+    max_split_chunks=None, observer=None, use_mmap=true, prefault=false))]
+#[allow(clippy::too_many_arguments)]
+fn read_xml_par(
+    py: Python<'_>,
+    path: String,
+    separator_tag: String,
+    chunks: usize,
+    field_mapping: Option<HashMap<String, String>>,
+    drop_fields: Option<Vec<String>>,
+    filter: Option<Bound<'_, PyAny>>,
+    field_types: Option<HashMap<String, String>>,
+    dictionary_columns: Option<Vec<String>>,
+    schema: Option<Vec<String>>,
+    auto_dict: bool,
+    auto_dict_threshold: Option<f64>,
+    auto_dict_max_size: Option<usize>,
+    strict_types: bool,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
+    use_mmap: bool,
+    prefault: bool,
+) -> PyResult<Py<PyAny>> {
+    let plan = execution_plan_from_kwargs(
+        field_mapping,
+        drop_fields,
+        filter.as_ref(),
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
+        auto_dict_threshold,
+        auto_dict_max_size,
+        strict_types,
+        max_split_chunks,
+        observer.as_ref(),
+    )?;
+    let batches = py
+        .detach(|| {
+            Pipeline::new(
+                XmlSplitter::new(&separator_tag),
+                XmlParser::new(&separator_tag),
+            )
+            .with_plan(plan)
+            .read_path_par(&path, chunks, use_mmap, prefault)
+        })
+        .map_err(py_err_from_rypipe)?;
+    record_batches_to_pyarrow_table(py, &batches).map(|table| table.unbind())
+}
+
+/// Bounded-memory read: returns a list of `pyarrow.RecordBatch`.
+#[pyfunction]
+#[pyo3(signature = (path, separator_tag="item".to_string(), memory=None, field_mapping=None,
+    drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None,
+    auto_dict=false, auto_dict_threshold=None, auto_dict_max_size=None, strict_types=false,
+    max_split_chunks=None, observer=None, use_mmap=true, prefault=false))]
+#[allow(clippy::too_many_arguments)]
+fn read_xml_stream(
+    py: Python<'_>,
+    path: String,
+    separator_tag: String,
+    memory: Option<Bound<'_, PyAny>>,
+    field_mapping: Option<HashMap<String, String>>,
+    drop_fields: Option<Vec<String>>,
+    filter: Option<Bound<'_, PyAny>>,
+    field_types: Option<HashMap<String, String>>,
+    dictionary_columns: Option<Vec<String>>,
+    schema: Option<Vec<String>>,
+    auto_dict: bool,
+    auto_dict_threshold: Option<f64>,
+    auto_dict_max_size: Option<usize>,
+    strict_types: bool,
+    max_split_chunks: Option<usize>,
+    observer: Option<Bound<'_, PyAny>>,
+    use_mmap: bool,
+    prefault: bool,
+) -> PyResult<Py<PyAny>> {
+    let _ = use_mmap; // the bounded path reads through InputBuffer directly
+    let budget = match memory {
+        Some(value) => MemoryBudget::new(memory_bytes(&value)?),
+        None => MemoryBudget::new(64 * 1024 * 1024),
+    };
+    let plan = execution_plan_from_kwargs(
+        field_mapping,
+        drop_fields,
+        filter.as_ref(),
+        field_types,
+        dictionary_columns,
+        schema,
+        auto_dict,
+        auto_dict_threshold,
+        auto_dict_max_size,
+        strict_types,
+        max_split_chunks,
+        observer.as_ref(),
+    )?;
+    let batches = py
+        .detach(|| {
+            Pipeline::new(
+                XmlSplitter::new(&separator_tag),
+                XmlParser::new(&separator_tag),
+            )
+            .with_plan(plan)
+            .read_path_stream(&path, budget, prefault)
+        })
+        .map_err(py_err_from_rypipe)?;
+    record_batches_to_pyarrow_batches(py, &batches).map(|list| list.unbind().into_any())
+}
+
 #[pymodule]
 fn _xmlstreamer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_document, m)?)?;
@@ -173,6 +381,9 @@ fn _xmlstreamer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_tag_is_well_formed, m)?)?;
     m.add_function(wrap_pyfunction!(end_tag_is_well_formed, m)?)?;
     m.add_function(wrap_pyfunction!(is_xml_name, m)?)?;
+    m.add_function(wrap_pyfunction!(read_xml, m)?)?;
+    m.add_function(wrap_pyfunction!(read_xml_par, m)?)?;
+    m.add_function(wrap_pyfunction!(read_xml_stream, m)?)?;
     m.add_class::<Tokenizer>()?;
     Ok(())
 }

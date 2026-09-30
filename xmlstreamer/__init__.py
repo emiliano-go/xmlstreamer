@@ -58,9 +58,48 @@ __all__ = [
     "USER_AGENT",
     "UnsupportedSchemeError",
     "XMLStreamerError",
+    "XmlAdapter",
+    "XmlSource",
+    "CastTypes",
+    "DropFields",
+    "FilterRows",
+    "FilterRowsAll",
+    "FilterRowsAny",
+    "FilterRowsNot",
+    "RenameFields",
+    "col",
+    "collect",
+    "to_arrow",
+    "to_csv",
+    "to_pandas",
+    "to_parquet",
+    "to_polars",
     "__version__",
     "to_nested",
 ]
+
+# rypipe adapter surface. Imported at the bottom of this module so the
+# low-level streaming API above is defined first.
+from rypipe import col  # noqa: E402
+from .rypipe_adapter import XmlAdapter  # noqa: E402
+from .sinks import (  # noqa: E402
+    collect,
+    to_arrow,
+    to_csv,
+    to_pandas,
+    to_parquet,
+    to_polars,
+)
+from .source import XmlSource  # noqa: E402
+from .stages import (  # noqa: E402
+    CastTypes,
+    DropFields,
+    FilterRows,
+    FilterRowsAll,
+    FilterRowsAny,
+    FilterRowsNot,
+    RenameFields,
+)
 
 # Define the type of the feed_generator
 FeedGeneratorT = Generator[bytes, None, None]

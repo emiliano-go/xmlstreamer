@@ -648,3 +648,286 @@ fn decode_ref(bytes: &[u8], amp: usize) -> Option<(String, usize)> {
     };
     Some((replacement, semi + 1))
 }
+
+// ---------------------------------------------------------------------------
+// Borrow-first item fields (adapter path)
+// ---------------------------------------------------------------------------
+//
+// The streaming path flattens a whole document into owned `String`s. The
+// rypipe `RecordParser` can do better: leaf text is usually a single
+// entity-free run, so it can be borrowed straight from the input and handed
+// to the engine as `Cow::Borrowed`. Only text that spans multiple runs
+// (mixed content) or contains entities is materialized.
+
+/// A flattened field value, borrowing the input when it can.
+pub enum FlatVal<'a> {
+    Empty,
+    Borrowed(&'a str),
+    Owned(String),
+}
+
+impl<'a> FlatVal<'a> {
+    /// Python's `str.rstrip("\n")` on the flattened value.
+    pub fn rstrip_newlines(self) -> std::borrow::Cow<'a, str> {
+        match self {
+            FlatVal::Empty => std::borrow::Cow::Borrowed(""),
+            FlatVal::Borrowed(s) => std::borrow::Cow::Borrowed(s.trim_end_matches('\n')),
+            FlatVal::Owned(mut s) => {
+                while s.ends_with('\n') {
+                    s.pop();
+                }
+                std::borrow::Cow::Owned(s)
+            }
+        }
+    }
+
+    pub fn trim_is_empty(&self) -> bool {
+        match self {
+            FlatVal::Empty => true,
+            FlatVal::Borrowed(s) => s.trim().is_empty(),
+            FlatVal::Owned(s) => s.trim().is_empty(),
+        }
+    }
+}
+
+/// Accumulates an element's direct character data, borrowing a single run.
+#[derive(Default)]
+struct TextBuf {
+    has: bool,
+    start: usize,
+    end: usize,
+    owned: Option<String>,
+}
+
+impl TextBuf {
+    fn materialize(&mut self, content: &[u8]) {
+        if self.owned.is_none() {
+            let mut out = String::new();
+            if self.has {
+                out.push_str(std::str::from_utf8(&content[self.start..self.end]).unwrap_or(""));
+            }
+            self.owned = Some(out);
+            self.has = false;
+        }
+    }
+
+    fn push_run(&mut self, content: &[u8], start: usize, end: usize) {
+        let run = std::str::from_utf8(&content[start..end]).unwrap_or("");
+        if let Some(owned) = self.owned.as_mut() {
+            owned.push_str(run);
+            return;
+        }
+        if !self.has {
+            self.has = true;
+            self.start = start;
+            self.end = end;
+        } else if self.end == start {
+            self.end = end;
+        } else {
+            self.materialize(content);
+            self.owned.as_mut().unwrap().push_str(run);
+        }
+    }
+
+    fn push_owned(&mut self, content: &[u8], text: String) {
+        self.materialize(content);
+        self.owned.as_mut().unwrap().push_str(&text);
+    }
+
+    fn is_empty(&self) -> bool {
+        if let Some(owned) = &self.owned {
+            return owned.is_empty();
+        }
+        !self.has || self.start == self.end
+    }
+
+    fn into_val(self, content: &[u8]) -> FlatVal<'_> {
+        if let Some(owned) = self.owned {
+            FlatVal::Owned(owned)
+        } else if self.has {
+            FlatVal::Borrowed(std::str::from_utf8(&content[self.start..self.end]).unwrap_or(""))
+        } else {
+            FlatVal::Empty
+        }
+    }
+}
+
+struct TextFrame {
+    tag: String,
+    key: String,
+    text: TextBuf,
+    has_children: bool,
+}
+
+fn read_text_run(content: &[u8], mut i: usize, target: &mut TextBuf) -> Option<usize> {
+    let n = content.len();
+    while i < n && content[i] != b'<' {
+        if content[i] == b'&' {
+            let (decoded, next) = decode_ref(content, i)?;
+            target.push_owned(content, decoded);
+            i = next;
+            continue;
+        }
+        let start = i;
+        while i < n && content[i] != b'<' && content[i] != b'&' {
+            i += 1;
+        }
+        let run = std::str::from_utf8(&content[start..i]).ok()?;
+        if has_forbidden_char(run) {
+            return None;
+        }
+        target.push_run(content, start, i);
+    }
+    Some(i)
+}
+
+fn number_key(
+    path: &str,
+    appearances: &mut std::collections::HashMap<String, usize>,
+    keys: &mut std::collections::HashSet<String>,
+) -> String {
+    let mut key = match appearances.get_mut(path) {
+        Some(count) => {
+            *count += 1;
+            format!("{path}_{count}")
+        }
+        None => {
+            appearances.insert(path.to_string(), 0);
+            path.to_string()
+        }
+    };
+    // `keys` holds emitted keys only, matching the streaming parser's
+    // collision rule (it checks the values already in `tags`).
+    while keys.contains(&key) {
+        let count = appearances.get_mut(path).unwrap();
+        *count += 1;
+        key = format!("{path}_{count}");
+    }
+    key
+}
+
+/// Flatten an item's inner bytes into ordered `(key, value)` fields.
+///
+/// Returns `None` when the content is not well formed (the item is dropped).
+/// Leaf values borrow `content` where possible.
+pub fn parse_item_flat<'a>(content: &'a [u8], sep: &str) -> Option<Vec<(String, FlatVal<'a>)>> {
+    let n = content.len();
+    let mut i = 0usize;
+    let mut stack: Vec<TextFrame> = Vec::new();
+    let mut fields: Vec<(String, FlatVal<'_>)> = Vec::new();
+    let mut appearances: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut root = TextBuf::default();
+    let mut seen_child = false;
+
+    while i < n {
+        if content[i] != b'<' {
+            let target = match stack.last_mut() {
+                Some(frame) => &mut frame.text,
+                None => &mut root,
+            };
+            i = read_text_run(content, i, target)?;
+            continue;
+        }
+
+        if content[i..].starts_with(b"<!--") {
+            i = find_seq(content, i + 4, b"-->")? + 3;
+            continue;
+        }
+        if content[i..].starts_with(b"<![CDATA[") {
+            let end = find_seq(content, i + 9, b"]]>")?;
+            let raw = std::str::from_utf8(&content[i + 9..end]).ok()?;
+            if has_forbidden_char(raw) {
+                return None;
+            }
+            let target = match stack.last_mut() {
+                Some(frame) => &mut frame.text,
+                None => &mut root,
+            };
+            target.push_run(content, i + 9, end);
+            i = end + 3;
+            continue;
+        }
+        if content[i..].starts_with(b"<?") {
+            i = find_seq(content, i + 2, b"?>")? + 2;
+            continue;
+        }
+        if content[i..].starts_with(b"<!") {
+            return None;
+        }
+
+        if i + 1 < n && content[i + 1] == b'/' {
+            if stack.is_empty() {
+                return None;
+            }
+            let end = find_tag_end(content, i + 1)?;
+            let tag = &content[i..end];
+            if !end_tag_is_well_formed(tag) {
+                return None;
+            }
+            let name = end_tag_name(tag);
+            let frame = stack.pop().unwrap();
+            if name != frame.tag.as_bytes() {
+                return None;
+            }
+            i = end;
+            let text = frame.text.into_val(content);
+            if !frame.has_children || !text.trim_is_empty() {
+                keys.insert(frame.key.clone());
+                fields.push((frame.key, text));
+            }
+            continue;
+        }
+
+        let end = find_tag_end(content, i + 1)?;
+        let tag = &content[i..end];
+        if !start_tag_is_well_formed(tag) {
+            return None;
+        }
+        let name = match start_tag_name(tag) {
+            Some(raw) => std::str::from_utf8(raw).ok()?.to_string(),
+            None => return None,
+        };
+        let self_closing = is_self_closing(tag);
+        let frame = if stack.is_empty() {
+            seen_child = true;
+            TextFrame {
+                tag: name.clone(),
+                key: number_key(&name, &mut appearances, &mut keys),
+                text: TextBuf::default(),
+                has_children: false,
+            }
+        } else {
+            stack.last_mut().unwrap().has_children = true;
+            // The implicit wrapper is not on the stack: any ancestor here
+            // prefixes the path.
+            let path = format!("{}/{}", stack.last().unwrap().key, name);
+            let key = number_key(&path, &mut appearances, &mut keys);
+            TextFrame {
+                tag: name,
+                key,
+                text: TextBuf::default(),
+                has_children: false,
+            }
+        };
+        i = end;
+        stack.push(frame);
+        if self_closing {
+            let frame = stack.pop().unwrap();
+            let text = frame.text.into_val(content);
+            if !frame.has_children || !text.trim_is_empty() {
+                keys.insert(frame.key.clone());
+                fields.push((frame.key, text));
+            }
+        }
+    }
+
+    if !stack.is_empty() {
+        return None;
+    }
+    if !seen_child {
+        // The implicit wrapper is a leaf (bare text or empty).
+        return Some(vec![(sep.to_string(), root.into_val(content))]);
+    }
+    Some(fields)
+}

@@ -28,7 +28,9 @@ classifiers = [
 keywords = ["xml", "streaming", "parser", "lightweight", "http", "https", "ftp"]
 dependencies = [
   "chardet>=5.2",
-  "requests>=2.32"
+  "requests>=2.32",
+  "rypipe>=0.4.0",
+  "pyarrow>=15"
 ]
 
 [project.scripts]
