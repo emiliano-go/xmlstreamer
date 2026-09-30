@@ -336,10 +336,20 @@ impl Engine {
 
     fn advance_to(&mut self, open: bool) -> Option<TagMatch> {
         loop {
-            if self.tag_open_at >= 0 {
-                if self.resume_tag_scan() == -1 {
-                    return None;
+            // The resumable tag walk is only meaningful while looking for an
+            // opening separator tag (its attributes may hold `>` inside
+            // quotes). Looking for a closing tag, an unterminated run of
+            // `<...quote` is not a real tag and must not block the closing
+            // search: a stray `<` inside item text would otherwise swallow
+            // every following item. Reset the pending walk for open=false.
+            if open {
+                if self.tag_open_at >= 0 {
+                    if self.resume_tag_scan() == -1 {
+                        return None;
+                    }
+                    self.tag_open_at = -1;
                 }
+            } else {
                 self.tag_open_at = -1;
             }
 
