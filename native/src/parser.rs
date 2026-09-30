@@ -91,6 +91,14 @@ impl<S: ColumnarSink + ?Sized> FlatEmitter for RowEmitter<'_, S> {
         if !self.sink.wants(name) {
             return;
         }
+        // Locate-only mode (schema discovery): the sink needs the name, not
+        // the value. Push a null so the name is still recorded and skip value
+        // extraction/parsing entirely.
+        if !self.sink.needs_value() {
+            self.sink.put_field(name, Value::Null);
+            self.ordinal += 1;
+            return;
+        }
         let value = match self.types.get(name) {
             Some(kind) => typed_value(*kind, value),
             None => Value::Str(Cow::Borrowed(value)),

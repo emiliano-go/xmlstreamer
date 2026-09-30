@@ -226,6 +226,27 @@ def test_parallel_streaming_preserves_order_and_matches(tmp_path):
     assert parallel == expected
 
 
+def test_parallel_streaming_autodiscovers_columns(tmp_path):
+    # No schema: the parallel streaming executor runs a locate-only discovery
+    # pass, then the parser must still record every field name.
+    feed = (
+        b"<feed>"
+        + b"<item><a>1</a></item>" * 50
+        + b"<item><a>2</a><b>late</b></item>"
+        + b"</feed>"
+    )
+    path = _write(tmp_path, feed)
+    rows = [
+        row
+        for batch in _xmlstreamer.iter_xml_batches_par(
+            path, separator_tag="item", threads=2, memory="1MiB"
+        )
+        for row in batch.to_pylist()
+    ]
+    assert rows[-1]["b"] == "late"
+    assert len(rows) == 51
+
+
 def test_source_parallel_streaming_via_iter_record_batches(tmp_path):
     feed = build_feed([{"n": str(i)} for i in range(2000)])
     source = XmlSource(_write(tmp_path, feed), separator_tag="item")
