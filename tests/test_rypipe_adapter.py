@@ -200,6 +200,38 @@ def test_source_parallel_streaming_via_iter_record_batches(tmp_path):
     assert rows == [{"n": str(i)} for i in range(2000)]
 
 
+def test_field_types_emit_typed_values(tmp_path):
+    feed = (
+        b"<feed><item><id>1</id><year>1998</year></item>"
+        b"<item><id>2</id><year>2000</year></item></feed>"
+    )
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed),
+        separator_tag="item",
+        field_types={"id": "int64", "year": "int64"},
+    )
+    assert table.schema.field("id").type == pa.int64()
+    assert table.schema.field("year").type == pa.int64()
+    assert table.to_pylist() == [{"id": 1, "year": 1998}, {"id": 2, "year": 2000}]
+
+
+def test_untyped_values_stay_strings(tmp_path):
+    feed = b"<feed><item><id>1</id></item></feed>"
+    table = _xmlstreamer.read_xml(_write(tmp_path, feed), separator_tag="item")
+    assert table.schema.field("id").type == pa.string()
+    assert table.to_pylist() == [{"id": "1"}]
+
+
+def test_field_types_unparseable_value_is_null(tmp_path):
+    feed = b"<feed><item><id>1</id><year>not-a-year</year></item></feed>"
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed),
+        separator_tag="item",
+        field_types={"id": "int64", "year": "int64"},
+    )
+    assert table.to_pylist() == [{"id": 1, "year": None}]
+
+
 def test_projection_drop_fields(tmp_path):
     feed = build_feed([{"t": "a", "n": "1"}, {"t": "b", "n": "2"}])
     table = _xmlstreamer.read_xml(

@@ -7,11 +7,58 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use rypipe_core::{ColumnarSink, RecordParser, Value};
 
 use crate::scan;
 use crate::xml::{self, FlatEmitter, Scratch};
+
+/// The subset of `field_types` the adapter can parse directly while scanning.
+#[derive(Clone, Copy)]
+pub enum FieldKind {
+    Int64,
+    Float64,
+    Bool,
+}
+
+/// Map declared `field_types` strings to a scannable kind (others fall back to
+/// string values; the engine still casts them).
+pub fn field_kinds(types: Option<HashMap<String, String>>) -> HashMap<String, FieldKind> {
+    types
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, ty)| {
+            let kind = match ty.trim().to_ascii_lowercase().as_str() {
+                "int64" | "int" | "i64" => FieldKind::Int64,
+                "float64" | "float" | "f64" | "double" => FieldKind::Float64,
+                "bool" | "boolean" => FieldKind::Bool,
+                _ => return None,
+            };
+            Some((name, kind))
+        })
+        .collect()
+}
+
+fn typed_value<'a>(kind: FieldKind, value: &'a str) -> Value<'a> {
+    match kind {
+        FieldKind::Int64 => value
+            .trim()
+            .parse::<i64>()
+            .map(Value::Int64)
+            .unwrap_or(Value::Str(Cow::Borrowed(value))),
+        FieldKind::Float64 => value
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float64)
+            .unwrap_or(Value::Str(Cow::Borrowed(value))),
+        FieldKind::Bool => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Value::Bool(true),
+            "false" | "0" | "no" => Value::Bool(false),
+            _ => Value::Str(Cow::Borrowed(value)),
+        },
+    }
+}
 
 // One reusable parse scratch per OS thread. The engine shares a single parser
 // across rayon workers (and clones it for streaming), so a parser-owned
@@ -24,11 +71,13 @@ thread_local! {
 #[derive(Clone)]
 pub struct XmlParser {
     sep: Vec<u8>,
+    types: HashMap<String, FieldKind>,
 }
 
 /// Emits one row per item, using the engine's layout-prediction fast path.
 struct RowEmitter<'a, S: ColumnarSink + ?Sized> {
     sink: &'a mut S,
+    types: &'a HashMap<String, FieldKind>,
     ordinal: u32,
 }
 
@@ -42,20 +91,24 @@ impl<S: ColumnarSink + ?Sized> FlatEmitter for RowEmitter<'_, S> {
         if !self.sink.wants(name) {
             return;
         }
+        let value = match self.types.get(name) {
+            Some(kind) => typed_value(*kind, value),
+            None => Value::Str(Cow::Borrowed(value)),
+        };
         let matched = self
             .sink
             .expect_slot(self.ordinal)
             .map(|(slot, expected)| (slot, name.as_bytes() == expected));
         match matched {
             Some((slot, true)) => {
-                self.sink.put_field_at(slot, Value::Str(Cow::Borrowed(value)));
+                self.sink.put_field_at(slot, value);
             }
             Some((_, false)) => {
                 self.sink.layout_broken(self.ordinal);
-                self.sink.put_field(name, Value::Str(Cow::Borrowed(value)));
+                self.sink.put_field(name, value);
             }
             None => {
-                self.sink.put_field(name, Value::Str(Cow::Borrowed(value)));
+                self.sink.put_field(name, value);
             }
         }
         self.ordinal += 1;
@@ -71,9 +124,10 @@ impl<S: ColumnarSink + ?Sized> FlatEmitter for RowEmitter<'_, S> {
 }
 
 impl XmlParser {
-    pub fn new(separator_tag: &str) -> Self {
+    pub fn new(separator_tag: &str, types: HashMap<String, FieldKind>) -> Self {
         Self {
             sep: separator_tag.as_bytes().to_vec(),
+            types,
         }
     }
 
@@ -117,6 +171,7 @@ impl XmlParser {
 
             let mut emitter = RowEmitter {
                 sink: &mut *sink,
+                types: &self.types,
                 ordinal: 0,
             };
             // A malformed item returns None and emits nothing (dropped whole).
