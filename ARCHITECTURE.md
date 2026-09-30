@@ -1,9 +1,20 @@
 # Architecture
 
 One page on how xmlstreamer works inside, why it is built that way, and
-which invariants a change must preserve. The whole engine lives in
-`xmlstreamer/__init__.py` on purpose: you can read it top to bottom in
-one sitting, and this document is the map for that reading.
+which invariants a change must preserve.
+
+> **Engine location.** The byte-level tokenizer and the per-item parse
+> now run in the Rust engine under `native/` (built on `rypipe-core`,
+> compiled to `xmlstreamer._xmlstreamer`). `xmlstreamer/__init__.py` is
+> the configuration, acquisition and API surface; it drives the engine
+> across the FFI boundary and logs what the engine reports. The two-layer
+> design and every invariant below are unchanged: the Rust `Tokenizer`
+> is the byte layer (it skips markup sections and cuts items out), and
+> `native/src/xml.rs` parses one item in isolation. The Python class
+> names (`Tokenizer`, `ParsedItem`, `Sections`) remain the contract the
+> tests pin. The rest of this document describes the design the Rust
+> engine was ported to preserve, so it stays the map for the invariants,
+> not a line-by-line map of the current code.
 
 ## The two-layer design
 

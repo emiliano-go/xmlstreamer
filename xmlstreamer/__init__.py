@@ -9,7 +9,6 @@ import weakref
 import zlib
 from contextlib import closing
 from datetime import datetime
-from xml.parsers import expat
 
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -83,17 +82,13 @@ STREAM_CHUNK_SIZE: int = 64 * 1024
 
 def is_valid_xml_name(name: str) -> bool:
     """
-    Whether a tag can be called this, decided by the same parser that
-    reads the feed.
+    Whether a tag can be called this, decided by the same XML name rules
+    the engine uses.
     """
-    seen: list = []
-    parser = expat.ParserCreate()
-    parser.StartElementHandler = lambda tag, attrs: seen.append((tag, attrs))
     try:
-        parser.Parse(f"<{name}/>".encode(), True)
-    except Exception:
+        return _xmlstreamer.is_xml_name(name.encode("utf-8"))
+    except UnicodeEncodeError:
         return False
-    return len(seen) == 1 and seen[0][0] == name and not seen[0][1]
 
 GZIP_MAGIC_NUMBER: bytes = b"\x1f\x8b"
 
@@ -754,84 +749,9 @@ def get_feed_generator(
     return _owned_generator(feed_generator, temp_file.close)
 
 
-class ItemHandler:
-    """
-    Flattens one item's XML into {path: direct_text}: paths join tags
-    with "/", siblings sharing a path get numbered (path, path_1, ...).
-    Leaves always emit; parents only with non-whitespace direct text.
-    An item of bare text emits under the separator's own tag name.
-    """
-
-    __slots__ = ("tags", "tags_appearances", "_stack")
-
-    def __init__(self) -> None:
-        self.tags: Dict[str, str] = {}
-        self.tags_appearances: Dict[str, int] = {}
-        # Stack frames: [key, direct_text, has_children]
-        self._stack: list = []
-
-    def startElement(self, tag: str, attributes: Dict[str, str]) -> None:
-        if not self._stack:
-            # The root wrapper's key stays outside the numbering namespace:
-            # a field sharing its name keeps its bare key.
-            self._stack.append([tag, "", False])
-            return
-
-        self._stack[-1][2] = True
-        if len(self._stack) > 1:
-            path = f"{self._stack[-1][0]}/{tag}"
-        else:
-            # Direct child of the root wrapper: the path starts here.
-            path = tag
-
-        if path in self.tags_appearances:
-            self.tags_appearances[path] += 1
-            key = f"{path}_{self.tags_appearances[path]}"
-        else:
-            self.tags_appearances[path] = 0
-            key = path
-
-        if key in self.tags:
-            # A field named like a numbered sibling already took this
-            # key: number past it instead of overwriting its value.
-            taken: str = key
-            while key in self.tags:
-                self.tags_appearances[path] += 1
-                key = f"{path}_{self.tags_appearances[path]}"
-            logger.warning(
-                "Key collision on %r: <%s> numbered as %r instead. A field "
-                "named like a numbered sibling makes the shape ambiguous.",
-                taken, tag, key,
-            )
-
-        self._stack.append([key, "", False])
-
-    def endElement(self, tag: str) -> None:
-        key, direct_text, has_children = self._stack.pop()
-        if not self._stack:
-            # Root wrapper: emits only as a leaf (empty item edge).
-            if has_children is False:
-                self.tags[key] = direct_text
-            return
-        if has_children is False or direct_text.strip():
-            self.tags[key] = direct_text
-
-    def characters(self, content: str) -> None:
-        if self._stack:
-            self._stack[-1][1] += content
-
-
-def _forbid_entity_constructs(*args: Any) -> NoReturn:
-    """
-    Reject entity declarations and external entity references: the item
-    is discarded. Benign DOCTYPEs are allowed.
-    """
-    raise ValueError("entity declarations are forbidden")
-
-
 def sanitize_item_bytes(item_string: bytes) -> tuple:
     """
-    Return (bytes fit for expat, whether invalid ones were replaced).
+    Return (bytes fit for the parser, whether invalid bytes were replaced).
     Fast path: already-valid utf-8 goes through untouched; only invalid
     bytes pay the decode/re-encode round trip, and say so.
     """
@@ -1004,29 +924,10 @@ class ParsingState(Enum):
     EOF = "EOF"
 
 
-# Sections whose content is markup, never items: a separator tag found
-# inside one does not exist, and emitting it would fabricate a record.
-SPECIAL_SECTION_PREFIXES = (b"<!--", b"<![CDATA[", b"<!DOCTYPE", b"<?")
-LONGEST_SECTION_PREFIX: int = 9  # <![CDATA[ and <!DOCTYPE
-
 # How long the scanner waits before deciding a section never was
-# one. Generous: any real section closes well inside it.
+# one. Generous: any real section closes well inside it. The Rust
+# scanner itself lives in native/src/tokenizer.rs.
 MAX_SECTION_SIZE: int = 16 * 1024 * 1024
-
-# One pass finds any section opener: "<!" (comment, CDATA, DOCTYPE) or
-# "<?" (processing instruction).
-SECTION_OPENER_PATTERN: re.Pattern = re.compile(rb"<[!?]")
-# Inside a tag, only these bytes matter: quotes open and close runs
-# where ">" is ordinary text.
-TAG_STOP_PATTERN: re.Pattern = re.compile(rb"[>\"']")
-# Inside a DOCTYPE, brackets nest an internal subset, quotes hide
-# everything, and comments and instructions are markup of their own.
-DOCTYPE_STOP_PATTERN: re.Pattern = re.compile(rb"[<>\[\]\"']")
-QUOTES: tuple = (b'"', b"'")
-# XML says whitespace is exactly these four bytes.
-XML_WHITESPACE: bytes = b" \t\r\n"
-# What can never appear inside a name.
-NAME_STOP: bytes = b" \t\r\n=/<>\"'"
 
 
 # XML 1.0 names, spelled out in full.
@@ -1130,74 +1031,6 @@ def attvalue_is_well_formed(value: bytes) -> bool:
         pos = semicolon + 1
 
 
-def name_end(tag: bytes, pos: int, end: int) -> int:
-    """End of the XML name starting at `pos`, or -1 when it is not one."""
-    start: int = pos
-    while pos < end and tag[pos:pos + 1] not in NAME_STOP:
-        pos += 1
-    if pos == start or not is_xml_name(tag[start:pos]):
-        return -1
-    return pos
-
-
-def start_tag_is_well_formed(tag: bytes) -> bool:
-    """
-    A start tag as XML defines it: a name, then attributes separated by
-    whitespace, each named once, quoted, and free of "<". Walked byte by
-    byte, so a huge attribute value costs a scan and never backtracking.
-    """
-    end: int = len(tag) - 1  # the closing ">"
-    if tag[end - 1:end] == b"/":
-        end -= 1  # empty-element tag: "/>" carries no space between
-    pos: int = name_end(tag, 1, end)
-    if pos == -1:
-        return False
-    seen: set = set()
-    while pos < end:
-        spaced: bool = False
-        while pos < end and tag[pos:pos + 1] in XML_WHITESPACE:
-            pos += 1
-            spaced = True
-        if pos >= end:
-            return True
-        if not spaced:
-            return False  # attributes must be separated
-        stop: int = name_end(tag, pos, end)
-        if stop == -1:
-            return False
-        name: bytes = tag[pos:stop]
-        if name in seen:
-            return False
-        seen.add(name)
-        pos = stop
-        while pos < end and tag[pos:pos + 1] in XML_WHITESPACE:
-            pos += 1
-        if tag[pos:pos + 1] != b"=":
-            return False
-        pos += 1
-        while pos < end and tag[pos:pos + 1] in XML_WHITESPACE:
-            pos += 1
-        quote: bytes = tag[pos:pos + 1]
-        if quote not in QUOTES:
-            return False
-        close: int = tag.find(quote, pos + 1, end)
-        if close == -1 or not attvalue_is_well_formed(tag[pos + 1:close]):
-            return False
-        pos = close + 1
-    return True
-
-
-def end_tag_is_well_formed(tag: bytes) -> bool:
-    """An end tag carries a name, optional whitespace, and nothing else."""
-    end: int = len(tag) - 1
-    pos: int = name_end(tag, 2, end)
-    if pos == -1:
-        return False
-    while pos < end and tag[pos:pos + 1] in XML_WHITESPACE:
-        pos += 1
-    return pos == end
-
-
 @dataclasses.dataclass(slots=True)
 class Sections:
     """
@@ -1223,526 +1056,150 @@ class Sections:
             )
 
 
-@dataclasses.dataclass(slots=True)
+
+
 class Tokenizer:
-    feed_generator: FeedGeneratorT
-    separator_tag: str
-    buffer_size: int
-    sections: Sections = dataclasses.field(default_factory=Sections)
-    # Monotonic instant after which scanning stops, so a slow source
-    # cannot outlive the run's budget between two items.
-    deadline: Optional[float] = None
+    """
+    The byte layer, now the Rust engine: it scans the stream for the
+    separator tags, skips markup sections, cuts out one item's bytes and
+    parses it in isolation. This Python class is the thin configuration
+    and stats surface: it feeds the generator's chunks in and turns the
+    engine's results into ParsedItem objects.
+    """
 
-    BUFFER: bytearray = dataclasses.field(default_factory=bytearray)
-    # Consumption cursor: the pending bytes are BUFFER[POS:].
-    # Consumed bytes compact away once per refill, never per item.
-    POS: int = 0
-    # Scanner cursor over what is already classified. It only moves
-    # forward, so a huge section costs one pass, not one per refill.
-    SCAN: int = 0
-
-    # --- Internal variables. --- #
-    PARSING_STATE: ParsingState = ParsingState.SEEK_OPEN
-    # Terminator awaited while inside a section, with where it opened
-    # and how long it may stay unterminated.
-    SECTION: Optional[bytes] = None
-    SECTION_OPEN_AT: int = -1
-    SECTION_LIMIT: int = 0
-    SECTION_IS_DOCTYPE: bool = False
-    # Resumable state of a DOCTYPE walk: subset depth, the quote it is
-    # inside, and the terminator of an inner comment or instruction.
-    DTD_DEPTH: int = 0
-    DTD_QUOTE: bytes = b""
-    DTD_INNER: bytes = b""
-    # Set once the section outlived its limit and is being discarded
-    # ("markup" policy): the warning is not repeated per refill.
-    SECTION_GIVEN_UP: bool = False
-    # Resumable walk of a tag whose ">" has not arrived: where it
-    # opened, how far the walk got, and the quote it is inside.
-    TAG_OPEN_AT: int = -1
-    TAG_SCAN: int = 0
-    TAG_QUOTE: bytes = b""
-    TIMED_OUT: bool = False
-    # Separator tags the feed spelled wrong (unquoted or repeated
-    # attributes, leftovers in a closing tag): said once, counted.
-    MALFORMED_TAGS: int = 0
-
-    actual_item: ParsedItem = dataclasses.field(init=False)
-    opening_tag_pattern: re.Pattern = dataclasses.field(init=False)
-    closing_tag_pattern: re.Pattern = dataclasses.field(init=False)
-    wrapper_open: bytes = dataclasses.field(init=False)
-    wrapper_close: bytes = dataclasses.field(init=False)
-
-    def __post_init__(self) -> None:
-        # Construction-time checks; hot-loop fields are never revalidated.
-        if not isinstance(self.feed_generator, collections.abc.Generator):
+    def __init__(
+        self,
+        feed_generator: FeedGeneratorT,
+        separator_tag: str,
+        buffer_size: int,
+        sections: Optional[Sections] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
+        if not isinstance(feed_generator, collections.abc.Generator):
             raise TypeError("feed_generator must be a generator")
-        if not isinstance(self.separator_tag, str):
+        if not isinstance(separator_tag, str):
             raise TypeError("separator_tag must be a str")
-        if not is_valid_xml_name(self.separator_tag):
+        if not is_valid_xml_name(separator_tag):
             raise ValueError(
-                f"separator_tag {self.separator_tag!r} is not a name an "
+                f"separator_tag {separator_tag!r} is not a name an "
                 "XML tag can have"
             )
-        if isinstance(self.buffer_size, bool)\
-                or not isinstance(self.buffer_size, int):
+        if isinstance(buffer_size, bool) or not isinstance(buffer_size, int):
             raise TypeError("buffer_size must be an int")
-        if self.buffer_size <= 0:
+        if buffer_size <= 0:
             raise ValueError("buffer_size must be positive")
-        if not isinstance(self.sections, Sections):
+        if sections is None:
+            sections = Sections()
+        if not isinstance(sections, Sections):
             raise TypeError("sections must be a Sections(...) instance")
-        if self.deadline is not None:
-            if isinstance(self.deadline, bool)\
-                    or not isinstance(self.deadline, (int, float)):
+        if deadline is not None:
+            if isinstance(deadline, bool)\
+                    or not isinstance(deadline, (int, float)):
                 raise TypeError(
                     "deadline must be a monotonic instant, or None"
                 )
-        if not isinstance(self.BUFFER, (bytes, bytearray)):
-            raise TypeError("BUFFER must be bytes")
-        self.BUFFER = bytearray(self.BUFFER)
-        if not isinstance(self.POS, int):
-            raise TypeError("POS must be an int")
-        if not isinstance(self.PARSING_STATE, ParsingState):
-            raise TypeError("PARSING_STATE must be a ParsingState")
 
-        self.actual_item = ParsedItem()
-        self.initialize_tag_patterns()
-
-    def initialize_tag_patterns(self) -> None:
-        opening_tag: bytes = self.separator_tag.encode()
-        # Precomputed once: the per-item wrapper fed to expat.
-        self.wrapper_open = b"<" + opening_tag + b">"
-        self.wrapper_close = b"</" + opening_tag + b">"
-        # Attribute values may hold ">" (only "<" and "&" are illegal
-        # there): quoted runs are consumed whole.
-        self.opening_tag_pattern: re.Pattern = re.compile(
-            rb"<" + re.escape(opening_tag)
-            + rb"(\s+(?:[^>\"']|\"[^\"]*\"|'[^']*')*)?>"
+        self.feed_generator = feed_generator
+        self.separator_tag = separator_tag
+        self.buffer_size = buffer_size
+        self.sections = sections
+        remaining = (
+            None if deadline is None else max(0.0, deadline - time.monotonic())
         )
-
-        closing_tag: bytes = f"/{self.separator_tag}".encode()
-        self.closing_tag_pattern: re.Pattern = re.compile(
-            rb"<" + re.escape(closing_tag) + rb"(\s+[^>]*)?>"
+        self._engine = _xmlstreamer.Tokenizer(
+            separator_tag,
+            buffer_size,
+            sections.max_size,
+            sections.on_limit == "text",
+            remaining,
         )
+        self.PARSING_STATE = ParsingState.SEEK_OPEN
+        self.actual_item: ParsedItem = ParsedItem()
 
-    def feed_origin_buffer(self) -> bool:
-        """
-        Fill BUFFER, always reading at least one chunk: it must be able
-        to grow past buffer_size. Consumed bytes compact away here, once
-        per refill, and chunks are joined in one pass.
-        """
-        if self.POS:
-            del self.BUFFER[:self.POS]
-            # Every absolute position shifts with the buffer.
-            self.SCAN -= self.POS
-            self.TAG_SCAN -= self.POS
-            if self.SECTION_OPEN_AT >= 0:
-                self.SECTION_OPEN_AT -= self.POS
-            if self.TAG_OPEN_AT >= 0:
-                self.TAG_OPEN_AT -= self.POS
-            self.POS = 0
-        try:
-            content_present: bool = False
-            while len(self.BUFFER) < self.buffer_size\
-                    or content_present is False:
-                if self.deadline is not None\
-                        and time.monotonic() > self.deadline:
-                    # Checked per chunk: one slow source must not
-                    # outlive the budget inside a single refill.
-                    self.TIMED_OUT = True
-                    logger.warning(
-                        "> XMLStreamer > Time budget exhausted while "
-                        "reading the feed: stopping."
-                    )
-                    return False
-                content = next(self.feed_generator)
-                content_present = True
-                self.BUFFER += content
-        except StopIteration:
-            ...
+    @property
+    def MALFORMED_TAGS(self) -> int:
+        return self._engine.malformed_tags()
 
-        if content_present is False:
-            logger.debug(
-                "Feed origin buffer: content present: %s", content_present
-            )
-
-        return content_present
-
-    def classify_section(self, start: int) -> Optional[tuple]:
-        """
-        Classify the opener at `start` as (terminator, header, limit).
-        Returns None when it opens no section, and an empty tuple when
-        the buffer is too short to tell yet.
-        """
-        buffer: bytearray = self.BUFFER
-        limit: int = self.sections.max_size
-        if buffer.startswith(b"<!--", start):
-            return b"-->", 4, limit, False
-        if buffer.startswith(b"<![CDATA[", start):
-            return b"]]>", 9, limit, False
-        if buffer.startswith(b"<?", start):
-            return b"?>", 2, limit, False
-        if buffer.startswith(b"<!DOCTYPE", start):
-            # Its end is found by walking, not by matching a string:
-            # quotes and the internal subset both hide ">" bytes.
-            return b">", 9, limit, True
-        if len(buffer) - start < LONGEST_SECTION_PREFIX:
-            tail: bytes = bytes(buffer[start:])
-            if any(p.startswith(tail) for p in SPECIAL_SECTION_PREFIXES):
-                return ()
-        return None
-
-    def next_section_opener(self, start: int, endpos: int) -> int:
-        """Absolute position of the first "<!" or "<?" in a range."""
-        match = SECTION_OPENER_PATTERN.search(self.BUFFER, start, endpos)
-        return -1 if match is None else match.start()
-
-    def resume_doctype_scan(self, stop: int) -> int:
-        """
-        Continue the DOCTYPE walk from SECTION_OPEN_AT and return the
-        ">" that closes it, or -1 while it has not arrived before
-        `stop`. Quotes and internal-subset depth decide which ">"
-        counts; the walk is resumable across refills.
-        """
-        buffer = self.BUFFER
-        pos: int = self.SCAN
-        while True:
-            if self.DTD_INNER:
-                # Inside a comment or instruction of the subset.
-                end: int = buffer.find(self.DTD_INNER, pos, stop)
-                if end == -1:
-                    keep: int = stop - len(self.DTD_INNER) + 1
-                    self.SCAN = keep if keep > pos else pos
-                    return -1
-                pos = end + len(self.DTD_INNER)
-                self.DTD_INNER = b""
-                continue
-            if self.DTD_QUOTE:
-                close: int = buffer.find(self.DTD_QUOTE, pos, stop)
-                if close == -1:
-                    self.SCAN = stop
-                    return -1
-                pos = close + 1
-                self.DTD_QUOTE = b""
-                continue
-            match = DOCTYPE_STOP_PATTERN.search(buffer, pos, stop)
-            if match is None:
-                self.SCAN = stop
-                return -1
-            char: bytes = match.group()
-            idx: int = match.start()
-            if char == b">":
-                if self.DTD_DEPTH <= 0:
-                    self.SCAN = idx
-                    return idx
-                pos = idx + 1
-            elif char == b"[":
-                self.DTD_DEPTH += 1
-                pos = idx + 1
-            elif char == b"]":
-                self.DTD_DEPTH -= 1
-                pos = idx + 1
-            elif char == b"<":
-                if buffer.startswith(b"<!--", idx):
-                    self.DTD_INNER = b"-->"
-                    pos = idx + 4
-                elif buffer.startswith(b"<?", idx):
-                    self.DTD_INNER = b"?>"
-                    pos = idx + 2
-                elif stop - idx < 4 and b"<!--".startswith(
-                    bytes(buffer[idx:stop])
-                ):
-                    # Split opener: decide when the rest arrives.
-                    self.SCAN = idx
-                    return -1
-                else:
-                    pos = idx + 1
-            else:
-                self.DTD_QUOTE = char
-                pos = idx + 1
-
-    def check_delimiter(self, tag: bytes, shape: Callable) -> None:
-        """
-        A separator tag is located lexically, not parsed: an attribute
-        without quotes, a repeated one or leftovers in a closing tag do
-        not stop the item (its content is intact and goes through expat
-        as always), but they are never passed over in silence.
-        """
-        if shape(tag):
-            return
-        self.MALFORMED_TAGS += 1
-        if self.MALFORMED_TAGS == 1:
-            logger.warning(
-                "Malformed separator tag %r: the item is delivered (its "
-                "content parses), but the feed is not well-formed here.",
-                bytes(tag[:80]),
-            )
-
-    def warn_unterminated_at_eof(self) -> None:
-        """A section still open when the bytes run out lost its tail."""
-        if self.SECTION is None or self.TIMED_OUT:
-            return
-        logger.warning(
-            "Feed ended inside %s that never closed: %s bytes discarded.",
-            self.BUFFER[self.SECTION_OPEN_AT:self.SECTION_OPEN_AT + 9],
-            len(self.BUFFER) - self.SECTION_OPEN_AT,
-        )
-
-    def resume_tag_scan(self) -> int:
-        """
-        Continue the walk of the tag opened at TAG_OPEN_AT and return
-        the position of the ">" that closes it, or -1 while it has not
-        arrived. A ">" inside a quoted value closes nothing. The walk
-        never re-reads a byte, so a huge tag costs one pass in total.
-        """
-        buffer: bytearray = self.BUFFER
-        pos: int = self.TAG_SCAN
-        while True:
-            if self.TAG_QUOTE:
-                close: int = buffer.find(self.TAG_QUOTE, pos)
-                if close == -1:
-                    self.TAG_SCAN = len(buffer)
-                    return -1
-                self.TAG_QUOTE = b""
-                pos = close + 1
-                continue
-            match = TAG_STOP_PATTERN.search(buffer, pos)
-            if match is None:
-                self.TAG_SCAN = len(buffer)
-                return -1
-            char: bytes = match.group()
-            if char == b">":
-                self.TAG_SCAN = match.start()
-                return match.start()
-            self.TAG_QUOTE = char
-            pos = match.start() + 1
-
-    def pending_tag_tail(self, floor: int) -> int:
-        """ Absolute position where a suffix starts that may still grow
-        into a tag or a section opener; discarding it would lose data.
-        Returns len(BUFFER) when nothing needs keeping. """
-        idx: int = self.BUFFER.rfind(b"<", floor)
-        if idx == -1:
-            return len(self.BUFFER)
-        if self.TAG_OPEN_AT != idx:
-            # Start (or restart) the walk of this tag.
-            self.TAG_OPEN_AT = idx
-            self.TAG_SCAN = idx + 1
-            self.TAG_QUOTE = b""
-        if self.resume_tag_scan() != -1:
-            # The last tag is complete and already failed to match.
-            self.TAG_OPEN_AT = -1
-            return len(self.BUFFER)
-        return idx
-
-    def advance_to(self, pattern: re.Pattern) -> Optional[re.Match]:
-        """
-        Advance the scanner to the next match of `pattern` lying outside
-        every special section, or return None when the buffer runs out
-        and the caller must feed more. SCAN only moves forward: bytes
-        already classified are never scanned again.
-        """
-        buffer: bytearray = self.BUFFER
-        while True:
-            if self.TAG_OPEN_AT >= 0:
-                # Waiting on a tag whose ">" has not arrived: resuming
-                # the walk is cheaper than re-matching the whole tag.
-                if self.resume_tag_scan() == -1:
-                    return None
-                self.TAG_OPEN_AT = -1
-
-            if self.SECTION is not None:
-                # The window is measured from the opener over the
-                # stream, so the decision cannot depend on chunking.
-                window: int = self.SECTION_OPEN_AT + self.SECTION_LIMIT
-                # Once given up on ("markup" policy) the section runs
-                # until it closes or the feed ends, so does the search.
-                stop = len(buffer)
-                if not self.SECTION_GIVEN_UP and window < stop:
-                    stop = window
-                if self.SECTION_IS_DOCTYPE:
-                    end: int = self.resume_doctype_scan(stop)
-                else:
-                    end = buffer.find(self.SECTION, self.SCAN, stop)
-                if end == -1:
-                    if len(buffer) < window:
-                        # Keep the overlap: terminators straddle refills.
-                        if not self.SECTION_IS_DOCTYPE:
-                            self.SCAN = max(
-                                self.SCAN,
-                                len(buffer) - len(self.SECTION) + 1,
-                            )
-                        return None
-                    if self.SECTION_GIVEN_UP:
-                        # Already discarding: the terminator is simply
-                        # not here yet.
-                        return None
-                    logger.warning(
-                        "Unterminated %s after %s bytes: %s.",
-                        bytes(buffer[
-                            self.SECTION_OPEN_AT:self.SECTION_OPEN_AT + 9
-                        ]),
-                        self.SECTION_LIMIT,
-                        "reading it as text, not markup"
-                        if self.sections.on_limit == "text"
-                        else "discarding whatever follows it",
-                    )
-                    if self.sections.on_limit == "text":
-                        # Never was a section: re-read from past "<x".
-                        self.SCAN = self.SECTION_OPEN_AT + 2
-                        self.SECTION = None
-                        self.SECTION_IS_DOCTYPE = False
-                        self.DTD_DEPTH = 0
-                        self.DTD_QUOTE = b""
-                        self.DTD_INNER = b""
-                        continue
-                    # Still markup: keep discarding, never re-read, and
-                    # look again right now over what is already here.
-                    self.SECTION_GIVEN_UP = True
-                    continue
-                self.SCAN = end + len(self.SECTION)
-                self.SECTION = None
-                self.SECTION_IS_DOCTYPE = False
-                self.SECTION_GIVEN_UP = False
-                self.DTD_DEPTH = 0
-                self.DTD_QUOTE = b""
-                self.DTD_INNER = b""
-                continue
-
-            match = pattern.search(buffer, self.SCAN)
-            endpos: int = match.start() if match is not None else len(buffer)
-            opener: int = self.next_section_opener(self.SCAN, endpos)
-            if opener == -1:
-                if match is None:
-                    self.SCAN = self.pending_tag_tail(self.SCAN)
-                return match
-
-            section = self.classify_section(opener)
-            if section is None:
-                # A "<!" that opens nothing (a stray one): step over it.
-                self.SCAN = opener + 2
-                continue
-            if not section:
-                # Opener split at the boundary: decide with more bytes.
-                self.SCAN = opener
-                return None
-            terminator, header, limit, is_doctype = section
-            if not is_doctype:
-                stop = opener + limit
-                if stop > len(buffer):
-                    stop = len(buffer)
-                end = buffer.find(terminator, opener + header, stop)
-                if end != -1:
-                    # Whole section already in the buffer: skip it
-                    # without the resumable-section bookkeeping.
-                    self.SCAN = end + len(terminator)
-                    continue
-            self.SECTION = terminator
-            self.SECTION_OPEN_AT = opener
-            self.SECTION_LIMIT = limit
-            self.SECTION_IS_DOCTYPE = is_doctype
-            self.SECTION_GIVEN_UP = False
-            self.DTD_DEPTH = 0
-            self.DTD_QUOTE = b""
-            self.DTD_INNER = b""
-            self.SCAN = opener + header
-
-    def step(self) -> None:
-        if self.PARSING_STATE == ParsingState.SEEK_OPEN:
-            matching_pattern = self.advance_to(self.opening_tag_pattern)
-
-            if matching_pattern is None:
-                if self.SECTION is not None and not self.SECTION_GIVEN_UP:
-                    # Hold the opener: if it turns out to terminate
-                    # nowhere, those bytes are read again as text.
-                    self.POS = self.SECTION_OPEN_AT
-                else:
-                    # SCAN already sits at whatever must be kept (a
-                    # pending tag): everything before it is discarded.
-                    self.POS = self.SCAN
-                feeding_result: bool = self.feed_origin_buffer()
-                if feeding_result is False:
-                    self.warn_unterminated_at_eof()
-                    self.PARSING_STATE = ParsingState.EOF
-            else:
-                self.POS = self.SCAN = matching_pattern.end()
-                # Self-closing separators (<item />) carry no content:
-                # skip them and keep seeking the next opening tag.
-                opening = matching_pattern.group(0)
-                if matching_pattern.group(1):
-                    self.check_delimiter(opening, start_tag_is_well_formed)
-                if not opening[:-1].rstrip().endswith(b"/"):
-                    self.PARSING_STATE = ParsingState.SEEK_CLOSE
-
-        elif self.PARSING_STATE == ParsingState.SEEK_CLOSE:
-            matching_pattern = self.advance_to(self.closing_tag_pattern)
-
-            if matching_pattern is None:
-                # POS stays put: everything from it is item content.
-                feeding_result = self.feed_origin_buffer()
-                if feeding_result is False:
-                    if not self.TIMED_OUT:
-                        logger.warning(
-                            "Feed ended inside an item: %s bytes discarded "
-                            "(the download was cut, or the last item is "
-                            "unclosed).",
-                            len(self.BUFFER) - self.POS,
-                        )
-                    self.warn_unterminated_at_eof()
-                    self.PARSING_STATE = ParsingState.EOF
-            else:
-                if matching_pattern.group(1):
-                    self.check_delimiter(
-                        matching_pattern.group(0), end_tag_is_well_formed
-                    )
-                content: bytes = bytes(
-                    self.BUFFER[self.POS:matching_pattern.start()]
+    def _log_engine_events(self) -> None:
+        for event in self._engine.take_logs():
+            kind = event[0]
+            if kind == "unterminated":
+                _, opener, limit, markup = event
+                logger.warning(
+                    "Unterminated %s after %s bytes: %s.",
+                    opener,
+                    limit,
+                    "discarding whatever follows it"
+                    if markup
+                    else "reading it as text, not markup",
                 )
-                self.POS = self.SCAN = matching_pattern.end()
-
-                # isspace() instead of strip(): no copy of the item.
-                if not content or content.isspace():
-                    # An empty item is not a record in either spelling:
-                    # <item/> and <item></item> are the same nothing.
-                    self.PARSING_STATE = ParsingState.SEEK_OPEN
-                    return
-
-                self.actual_item.content = content
-                self.actual_item.parse_content(
-                    self.wrapper_open, self.wrapper_close
+            elif kind == "malformed_tag":
+                _, tag = event
+                logger.warning(
+                    "Malformed separator tag %r: the item is delivered "
+                    "(its content parses), but the feed is not well-formed "
+                    "here.",
+                    bytes(tag),
                 )
-
-                parsed = self.actual_item.parsed_content
-                if parsed is not None and (
-                    not parsed
-                    or (
-                        len(parsed) == 1
-                        and not parsed.get(self.separator_tag, "-").strip()
-                    )
-                ):
-                    # Nothing but markup inside (a comment, say): the
-                    # same nothing as <item/>, whatever the spelling.
-                    self.PARSING_STATE = ParsingState.SEEK_OPEN
-                    return
-
-                self.PARSING_STATE = ParsingState.ITEM_PARSED
-
-        elif self.PARSING_STATE == ParsingState.ITEM_PARSED:
-            self.actual_item = ParsedItem()
-            self.PARSING_STATE = ParsingState.SEEK_OPEN
-
-        elif self.PARSING_STATE == ParsingState.EOF:
-            logger.debug("> EOF:")
+            elif kind == "ended_in_item":
+                _, discarded = event
+                logger.warning(
+                    "Feed ended inside an item: %s bytes discarded "
+                    "(the download was cut, or the last item is unclosed).",
+                    discarded,
+                )
+            elif kind == "section_eof":
+                _, opener, discarded = event
+                logger.warning(
+                    "Feed ended inside %s that never closed: %s bytes "
+                    "discarded.",
+                    opener,
+                    discarded,
+                )
+            elif kind == "feed_timeout":
+                logger.warning(
+                    "> XMLStreamer > Time budget exhausted while reading "
+                    "the feed: stopping."
+                )
 
     def get_item(self) -> Optional[ParsedItem]:
-        self.step()
-        while self.PARSING_STATE != ParsingState.ITEM_PARSED:
-            self.step()
+        while True:
+            code, payload = self._engine.next_item()
+            self._log_engine_events()
 
-            if self.PARSING_STATE == ParsingState.EOF:
+            if code == 0:  # EOF
+                self.PARSING_STATE = ParsingState.EOF
                 return None
 
-        return self.actual_item
+            if code == 1:  # the engine needs more bytes
+                try:
+                    chunk = next(self.feed_generator)
+                except StopIteration:
+                    self._engine.finish()
+                else:
+                    self._engine.feed(chunk)
+                continue
+
+            content, parsed, replaced, collisions = payload
+            for taken, tag, key in collisions:
+                logger.warning(
+                    "Key collision on %r: <%s> numbered as %r instead. A "
+                    "field named like a numbered sibling makes the shape "
+                    "ambiguous.",
+                    taken, tag, key,
+                )
+            if parsed is None:
+                logger.warning(
+                    "Discarding unparseable item (%s): %r",
+                    "malformed XML",
+                    bytes(content[:120]),
+                )
+            self.actual_item = ParsedItem(
+                content=bytes(content),
+                parsed_content=parsed,
+                replaced=replaced,
+            )
+            return self.actual_item
 
 
 class FeedRun:
@@ -2045,7 +1502,7 @@ class StreamInterpreter:
 
     @property
     def stats_parsed_items(self) -> int:
-        """Of those, the ones expat could parse."""
+        """Of those, the ones the engine could parse."""
         return self.last_run.stats_parsed_items if self.last_run else 0
 
     @property
