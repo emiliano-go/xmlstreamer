@@ -1,32 +1,23 @@
 //! Byte-scanning helpers shared by the rypipe `Splitter` and `RecordParser`.
 //!
 //! These locate the separator tags lexically and skip markup sections
-//! (comments, CDATA, processing instructions) so a separator written inside
-//! one is never mistaken for a record boundary. DOCTYPE is intentionally not
-//! a section here: its quotes and internal-subset brackets make it a walk of
-//! its own, and a separator inside a DOCTYPE is not a real-record case the
-//! adapter has to support.
+//! (comments, CDATA, processing instructions, DOCTYPE declarations) so a
+//! separator written inside one is never mistaken for a record boundary.
+
+/// What `section_end` found at a position.
+pub enum Section {
+    /// Not a section opener.
+    No,
+    /// A section opener that does not close in these bytes.
+    Unterminated,
+    /// A complete section; the index just past it.
+    End(usize),
+}
 
 /// Python's bytes `\s` set, which is what the scanner's tag patterns use.
 #[inline]
 pub fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0b' | b'\x0c')
-}
-
-/// Return `(terminator, header_len)` when a section opens at `start`.
-#[inline]
-pub fn section_at(bytes: &[u8], start: usize) -> Option<(&'static [u8], usize)> {
-    let rest = bytes.get(start..)?;
-    if rest.starts_with(b"<!--") {
-        return Some((b"-->", 4));
-    }
-    if rest.starts_with(b"<![CDATA[") {
-        return Some((b"]]>", 9));
-    }
-    if rest.starts_with(b"<?") {
-        return Some((b"?>", 2));
-    }
-    None
 }
 
 #[inline]
@@ -35,6 +26,89 @@ pub fn find_seq(bytes: &[u8], from: usize, seq: &[u8]) -> Option<usize> {
         return None;
     }
     memchr::memmem::find(&bytes[from..], seq).map(|r| from + r)
+}
+
+/// Walk a `<!DOCTYPE …>` declaration, from `start` (at `<!DOCTYPE`) to just
+/// past its closing `>`. Quotes hide `>`, brackets nest the internal subset,
+/// and comments/instructions inside the subset are skipped.
+fn skip_doctype(bytes: &[u8], start: usize) -> Option<usize> {
+    let n = bytes.len();
+    let mut i = start + 9;
+    let mut depth: i32 = 0;
+    let mut quote: u8 = 0;
+    while i < n {
+        if quote != 0 {
+            if bytes[i] == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<!--") {
+            i = find_seq(bytes, i + 4, b"-->")? + 3;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<?") {
+            i = find_seq(bytes, i + 2, b"?>")? + 2;
+            continue;
+        }
+        match bytes[i] {
+            b'"' | b'\'' => {
+                quote = bytes[i];
+                i += 1;
+            }
+            b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'>' => {
+                if depth <= 0 {
+                    return Some(i + 1);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Classify the markup section opening at `start` (comments, CDATA, PIs,
+/// DOCTYPE declarations).
+pub fn section_end(bytes: &[u8], start: usize) -> Section {
+    let rest = match bytes.get(start..) {
+        Some(r) => r,
+        None => return Section::No,
+    };
+    if rest.starts_with(b"<!--") {
+        return match find_seq(bytes, start + 4, b"-->") {
+            Some(end) => Section::End(end + 3),
+            None => Section::Unterminated,
+        };
+    }
+    if rest.starts_with(b"<![CDATA[") {
+        return match find_seq(bytes, start + 9, b"]]>") {
+            Some(end) => Section::End(end + 3),
+            None => Section::Unterminated,
+        };
+    }
+    if rest.starts_with(b"<?") {
+        return match find_seq(bytes, start + 2, b"?>") {
+            Some(end) => Section::End(end + 2),
+            None => Section::Unterminated,
+        };
+    }
+    if rest.starts_with(b"<!DOCTYPE") {
+        return match skip_doctype(bytes, start) {
+            Some(end) => Section::End(end),
+            None => Section::Unterminated,
+        };
+    }
+    Section::No
 }
 
 /// End (exclusive) of the tag whose content starts at `from` (the byte after
@@ -66,14 +140,13 @@ pub fn find_open_sep(bytes: &[u8], from: usize, sep: &[u8]) -> Option<(usize, us
     let mut i = from;
     while i < n {
         let p = rypipe_core::scan::find(bytes, i, b'<')?;
-        if let Some((terminator, header)) = section_at(bytes, p) {
-            match find_seq(bytes, p + header, terminator) {
-                Some(end) => {
-                    i = end + terminator.len();
-                    continue;
-                }
-                None => return None,
+        match section_end(bytes, p) {
+            Section::End(end) => {
+                i = end;
+                continue;
             }
+            Section::Unterminated => return None,
+            Section::No => {}
         }
         if p + 1 + sep.len() <= n && &bytes[p + 1..p + 1 + sep.len()] == sep {
             let q = p + 1 + sep.len();
@@ -96,14 +169,13 @@ pub fn find_close_sep(bytes: &[u8], from: usize, sep: &[u8]) -> Option<(usize, u
     let mut i = from;
     while i < n {
         let p = rypipe_core::scan::find(bytes, i, b'<')?;
-        if let Some((terminator, header)) = section_at(bytes, p) {
-            match find_seq(bytes, p + header, terminator) {
-                Some(end) => {
-                    i = end + terminator.len();
-                    continue;
-                }
-                None => return None,
+        match section_end(bytes, p) {
+            Section::End(end) => {
+                i = end;
+                continue;
             }
+            Section::Unterminated => return None,
+            Section::No => {}
         }
         if p + 2 + sep.len() <= n
             && bytes[p + 1] == b'/'

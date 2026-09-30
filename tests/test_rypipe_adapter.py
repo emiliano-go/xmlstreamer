@@ -133,6 +133,43 @@ def test_streaming_matches_legacy(tmp_path, name, feed, sep, expected):
     assert rows == expected
 
 
+DOCTYPE_CASES = [
+    # benign declaration
+    b"<!DOCTYPE feed><feed><item><t>real</t></item></feed>",
+    # internal subset with a ghost <item> inside a quoted entity value
+    b'<!DOCTYPE feed [<!ENTITY ghost "<item><t>x</t></item>">]>'
+    b"<feed><item><t>real</t></item></feed>",
+    # ]> inside a quoted entity value does not end the declaration
+    b'<!DOCTYPE feed [<!ENTITY x "]> <item><t>ghost</t></item>">]>'
+    b"<feed><item><t>real</t></item></feed>",
+    # > inside a quoted system id
+    b'<!DOCTYPE feed SYSTEM "weird>name.dtd">'
+    b"<feed><item><t>real</t></item></feed>",
+    # nested brackets and a second entity
+    b'<!DOCTYPE feed [<!ENTITY x "[nested]"> <!ENTITY y "z">]>'
+    b"<feed><item><t>real</t></item></feed>",
+]
+
+
+@pytest.mark.parametrize("feed", DOCTYPE_CASES)
+def test_doctype_is_not_a_record(tmp_path, feed):
+    expected = [{"t": "real"}]
+    path = _write(tmp_path, feed)
+    assert legacy_items(feed, "item") == expected
+    assert _xmlstreamer.read_xml(path, separator_tag="item").to_pylist() == expected
+    assert (
+        _xmlstreamer.read_xml_par(path, separator_tag="item", chunks=2).to_pylist()
+        == expected
+    )
+    assert [
+        row
+        for batch in _xmlstreamer.read_xml_stream(
+            path, separator_tag="item", memory="1MiB"
+        )
+        for row in batch.to_pylist()
+    ] == expected
+
+
 def test_order_is_preserved_over_many_items(tmp_path):
     feed = build_feed([{"n": str(i)} for i in range(5000)])
     expected = [{"n": str(i)} for i in range(5000)]
