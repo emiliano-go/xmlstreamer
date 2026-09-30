@@ -114,23 +114,23 @@ def _projection(path: str) -> int:
     ).num_rows
 
 
-_PLAIN_SCHEMA = ["id", "title", "author", "publisher", "year"]
-_PLAIN_TYPES = {"id": "int64", "year": "int64"}
+# A declared schema acts as a projection: only these columns are wanted, so
+# the parser skips scanning the rest (the documented +80% projection win).
+_PROJ_SCHEMA = ["id"]
 
 
-def _columnar_typed(path: str) -> int:
+def _columnar_proj(path: str) -> int:
     from xmlstreamer import _xmlstreamer
 
     return _xmlstreamer.read_xml(
         path,
         separator_tag="item",
         use_mmap=True,
-        schema=_PLAIN_SCHEMA,
-        field_types=_PLAIN_TYPES,
+        schema=_PROJ_SCHEMA,
     ).num_rows
 
 
-def _par_typed(chunks: int) -> Callable[[str], int]:
+def _par_proj(chunks: int) -> Callable[[str], int]:
     def run(path: str) -> int:
         from xmlstreamer import _xmlstreamer
 
@@ -139,8 +139,7 @@ def _par_typed(chunks: int) -> Callable[[str], int]:
             separator_tag="item",
             chunks=chunks,
             use_mmap=True,
-            schema=_PLAIN_SCHEMA,
-            field_types=_PLAIN_TYPES,
+            schema=_PROJ_SCHEMA,
         ).num_rows
 
     return run
@@ -155,8 +154,8 @@ ENGINES: Dict[str, Callable] = {
     "rypipe stream64": _stream("64MiB"),
     "rypipe par-stream8": _par_stream(8),
     "rypipe columnar drop4": _projection,
-    "rypipe columnar typed": _columnar_typed,
-    "rypipe par8 typed": _par_typed(8),
+    "rypipe columnar proj1": _columnar_proj,
+    "rypipe par8 proj1": _par_proj(8),
 }
 
 
