@@ -700,6 +700,12 @@ pub trait FlatEmitter {
     fn row_start(&mut self);
     fn field(&mut self, name: &str, value: &str);
     fn row_end(&mut self);
+
+    /// Whether a field with this final name is wanted. Used to skip scanning
+    /// pure-text leaves whose column is dropped/projected out.
+    fn wants(&self, _name: &str) -> bool {
+        true
+    }
 }
 
 #[inline]
@@ -968,6 +974,38 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
         };
         let tag_span = (i + 1, i + 1 + name.len());
         let self_closing = is_self_closing(tag);
+
+        // Projection pushdown: a depth-1, first-occurrence, pure-text leaf
+        // whose column is unwanted can be skipped without scanning its value.
+        // Numbering state is kept (appearances records the occurrence) so
+        // later siblings still number the same as the streaming parser.
+        if scratch.stack.is_empty() && !self_closing && !emitter.wants(name) {
+            let path = KeySrc::Content(tag_span.0, tag_span.1);
+            let first = !scratch
+                .appearances
+                .iter()
+                .any(|(k, _)| key_eq(*k, path, content, &scratch.key_arena))
+                && !scratch
+                    .emitted
+                    .iter()
+                    .any(|k| key_eq(*k, path, content, &scratch.key_arena));
+            if first {
+                if let Some(lt) = rypipe_core::scan::find(content, end, b'<') {
+                    let after = lt + 2;
+                    let tag_bytes = &content[tag_span.0..tag_span.1];
+                    if content.get(lt..lt + 2) == Some(b"</")
+                        && after + tag_bytes.len() + 1 <= n
+                        && &content[after..after + tag_bytes.len()] == tag_bytes
+                        && content[after + tag_bytes.len()] == b'>'
+                    {
+                        scratch.appearances.push((path, 0));
+                        i = after + tag_bytes.len() + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         let key = if scratch.stack.is_empty() {
             seen_child = true;
             number_key(scratch, content, KeySrc::Content(tag_span.0, tag_span.1))

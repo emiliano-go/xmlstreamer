@@ -206,3 +206,44 @@ def test_projection_drop_fields(tmp_path):
         _write(tmp_path, feed), separator_tag="item", drop_fields=["n"]
     )
     assert table.column_names == ["t"]
+
+
+@pytest.mark.parametrize(
+    "feed,sep,drops,expected",
+    [
+        # depth-1 leaf dropped
+        (
+            b"<feed><item><t>a</t><n>1</n></item><item><t>b</t><n>2</n></item></feed>",
+            "item",
+            ["n"],
+            [{"t": "a"}, {"t": "b"}],
+        ),
+        # nested path dropped
+        (
+            b"<item><title>A</title><location><city>V</city>"
+            b"<country>AA</country></location></item>",
+            "item",
+            ["location/city"],
+            [{"title": "A", "location/country": "AA"}],
+        ),
+        # repeated siblings: dropping the first must NOT shift numbering
+        (
+            b"<item><cat>a</cat><cat>b</cat><cat>c</cat></item>",
+            "item",
+            ["cat"],
+            [{"cat_1": "b", "cat_2": "c"}],
+        ),
+        # literal numbered key + repeats under a drop
+        (
+            b"<item><x>a</x><x_1>natural</x_1><x>repeat</x></item>",
+            "item",
+            ["x"],
+            [{"x_1": "natural", "x_2": "repeat"}],
+        ),
+    ],
+)
+def test_projection_matches_legacy(tmp_path, feed, sep, drops, expected):
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed), separator_tag=sep, drop_fields=drops
+    )
+    assert table.to_pylist() == expected

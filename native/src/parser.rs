@@ -64,6 +64,10 @@ impl<S: ColumnarSink + ?Sized> FlatEmitter for RowEmitter<'_, S> {
     fn row_end(&mut self) {
         self.sink.end_row();
     }
+
+    fn wants(&self, name: &str) -> bool {
+        self.sink.wants(name)
+    }
 }
 
 impl XmlParser {
