@@ -62,10 +62,32 @@ impl XmlParser {
             }
 
             sink.begin_row();
+            // Ordinal counts *kept* fields, matching the engine's
+            // `current_ordinal` (it does not advance for dropped fields).
+            let mut ordinal: u32 = 0;
             for (name, value) in fields {
-                if sink.wants(&name) {
-                    sink.put_field(&name, Value::Str(value.rstrip_newlines()));
+                if !sink.wants(&name) {
+                    continue;
                 }
+                // Layout prediction: after row 1 the engine caches an
+                // ordinal -> (slot, name) map. A memcmp against the raw name
+                // lets us skip name resolution and a hash lookup entirely.
+                let matched = sink
+                    .expect_slot(ordinal)
+                    .map(|(slot, expected)| (slot, name.as_bytes() == expected));
+                match matched {
+                    Some((slot, true)) => {
+                        sink.put_field_at(slot, Value::Str(value.rstrip_newlines()));
+                    }
+                    Some((_, false)) => {
+                        sink.layout_broken(ordinal);
+                        sink.put_field(&name, Value::Str(value.rstrip_newlines()));
+                    }
+                    None => {
+                        sink.put_field(&name, Value::Str(value.rstrip_newlines()));
+                    }
+                }
+                ordinal += 1;
             }
             sink.end_row();
         }
