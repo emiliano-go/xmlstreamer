@@ -653,41 +653,67 @@ fn decode_ref(bytes: &[u8], amp: usize) -> Option<(String, usize)> {
 // Borrow-first item fields (adapter path)
 // ---------------------------------------------------------------------------
 //
-// The streaming path flattens a whole document into owned `String`s. The
-// rypipe `RecordParser` can do better: leaf text is usually a single
-// entity-free run, so it can be borrowed straight from the input and handed
-// to the engine as `Cow::Borrowed`. Only text that spans multiple runs
-// (mixed content) or contains entities is materialized.
+// The adapter reuses one `Scratch` across items: depth-1 keys and leaf text
+// borrow the chunk, mixed content / entity-decoded text is the only thing
+// materialized, and the field list is validated before anything is emitted
+// (a malformed item is dropped whole, like the streaming parser).
 
-/// A flattened field value, borrowing the input when it can.
-pub enum FlatVal<'a> {
+use std::borrow::Cow;
+
+/// Where a key's bytes live.
+#[derive(Clone, Copy)]
+enum KeySrc {
+    Content(usize, usize),
+    Arena(u32, u32),
+}
+
+/// Reusable parse state, one per parser (per chunk/thread).
+#[derive(Default)]
+pub struct Scratch {
+    stack: Vec<FlatFrame>,
+    pending: Vec<FlatPending>,
+    appearances: Vec<(KeySrc, usize)>,
+    emitted: Vec<KeySrc>,
+    key_arena: String,
+}
+
+struct FlatFrame {
+    tag: (usize, usize),
+    key: KeySrc,
+    text: TextBuf,
+    has_children: bool,
+}
+
+struct FlatPending {
+    key: KeySrc,
+    value: PendingVal,
+}
+
+enum PendingVal {
     Empty,
-    Borrowed(&'a str),
+    Content(usize, usize),
     Owned(String),
 }
 
-impl<'a> FlatVal<'a> {
-    /// Python's `str.rstrip("\n")` on the flattened value.
-    pub fn rstrip_newlines(self) -> std::borrow::Cow<'a, str> {
-        match self {
-            FlatVal::Empty => std::borrow::Cow::Borrowed(""),
-            FlatVal::Borrowed(s) => std::borrow::Cow::Borrowed(s.trim_end_matches('\n')),
-            FlatVal::Owned(mut s) => {
-                while s.ends_with('\n') {
-                    s.pop();
-                }
-                std::borrow::Cow::Owned(s)
-            }
-        }
-    }
+/// Sink for a validated item: one row per item, one field per flatten result.
+pub trait FlatEmitter {
+    fn row_start(&mut self);
+    fn field(&mut self, name: &str, value: &str);
+    fn row_end(&mut self);
+}
 
-    pub fn trim_is_empty(&self) -> bool {
-        match self {
-            FlatVal::Empty => true,
-            FlatVal::Borrowed(s) => s.trim().is_empty(),
-            FlatVal::Owned(s) => s.trim().is_empty(),
-        }
+#[inline]
+fn key_slice<'a>(key: KeySrc, content: &'a [u8], arena: &'a str) -> &'a str {
+    match key {
+        // SAFETY: keys point at tag bytes inside a UTF-8-validated chunk.
+        KeySrc::Content(s, e) => unsafe { std::str::from_utf8_unchecked(&content[s..e]) },
+        KeySrc::Arena(s, e) => &arena[s as usize..(s + e) as usize],
     }
+}
+
+#[inline]
+fn key_eq(a: KeySrc, b: KeySrc, content: &[u8], arena: &str) -> bool {
+    key_slice(a, content, arena) == key_slice(b, content, arena)
 }
 
 /// Accumulates an element's direct character data, borrowing a single run.
@@ -734,29 +760,96 @@ impl TextBuf {
         self.owned.as_mut().unwrap().push_str(&text);
     }
 
-    fn is_empty(&self) -> bool {
-        if let Some(owned) = &self.owned {
-            return owned.is_empty();
-        }
-        !self.has || self.start == self.end
-    }
-
-    fn into_val(self, content: &[u8]) -> FlatVal<'_> {
+    fn into_pending(self) -> PendingVal {
         if let Some(owned) = self.owned {
-            FlatVal::Owned(owned)
+            PendingVal::Owned(owned)
         } else if self.has {
-            FlatVal::Borrowed(std::str::from_utf8(&content[self.start..self.end]).unwrap_or(""))
+            PendingVal::Content(self.start, self.end)
         } else {
-            FlatVal::Empty
+            PendingVal::Empty
         }
     }
 }
 
-struct TextFrame {
-    tag: String,
-    key: String,
-    text: TextBuf,
-    has_children: bool,
+fn pending_str<'a>(value: &'a PendingVal, content: &'a [u8]) -> Cow<'a, str> {
+    match value {
+        PendingVal::Empty => Cow::Borrowed(""),
+        // SAFETY: text runs come from a UTF-8-validated chunk.
+        PendingVal::Content(s, e) => {
+            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&content[*s..*e]) })
+        }
+        PendingVal::Owned(s) => Cow::Borrowed(s.as_str()),
+    }
+}
+
+fn pending_trim_is_empty(value: &PendingVal, content: &[u8]) -> bool {
+    pending_str(value, content).trim().is_empty()
+}
+
+/// Append `"{path}_{count}"` to the arena and return its range.
+fn arena_key(scratch: &mut Scratch, content: &[u8], path: KeySrc, count: usize) -> KeySrc {
+    let path_owned = key_slice(path, content, &scratch.key_arena).to_string();
+    let off = scratch.key_arena.len() as u32;
+    scratch.key_arena.push_str(&path_owned);
+    scratch.key_arena.push('_');
+    scratch.key_arena.push_str(&count.to_string());
+    let len = scratch.key_arena.len() as u32 - off;
+    KeySrc::Arena(off, len)
+}
+
+/// Build (and cache) the output key for `path`, handling sibling numbering
+/// and literal-key collisions the same way the streaming parser does.
+fn number_key(scratch: &mut Scratch, content: &[u8], path: KeySrc) -> KeySrc {
+    let found = scratch
+        .appearances
+        .iter()
+        .position(|(k, _)| key_eq(*k, path, content, &scratch.key_arena));
+    let mut key = match found {
+        Some(idx) => {
+            scratch.appearances[idx].1 += 1;
+            let count = scratch.appearances[idx].1;
+            arena_key(scratch, content, path, count)
+        }
+        None => {
+            scratch.appearances.push((path, 0));
+            path
+        }
+    };
+    loop {
+        let collision = scratch
+            .emitted
+            .iter()
+            .any(|k| key_eq(*k, key, content, &scratch.key_arena));
+        if !collision {
+            break;
+        }
+        let idx = scratch
+            .appearances
+            .iter()
+            .position(|(k, _)| key_eq(*k, path, content, &scratch.key_arena))
+            .unwrap();
+        scratch.appearances[idx].1 += 1;
+        let count = scratch.appearances[idx].1;
+        key = arena_key(scratch, content, path, count);
+    }
+    key
+}
+
+/// Build the nested path `parent/tag` into the arena.
+fn nested_path(
+    scratch: &mut Scratch,
+    content: &[u8],
+    parent: KeySrc,
+    tag: (usize, usize),
+) -> Option<KeySrc> {
+    let parent_owned = key_slice(parent, content, &scratch.key_arena).to_string();
+    let tag_str = std::str::from_utf8(&content[tag.0..tag.1]).ok()?;
+    let off = scratch.key_arena.len() as u32;
+    scratch.key_arena.push_str(&parent_owned);
+    scratch.key_arena.push('/');
+    scratch.key_arena.push_str(tag_str);
+    let len = scratch.key_arena.len() as u32 - off;
+    Some(KeySrc::Arena(off, len))
 }
 
 fn read_text_run(content: &[u8], mut i: usize, target: &mut TextBuf) -> Option<usize> {
@@ -781,48 +874,30 @@ fn read_text_run(content: &[u8], mut i: usize, target: &mut TextBuf) -> Option<u
     Some(i)
 }
 
-fn number_key(
-    path: &str,
-    appearances: &mut std::collections::HashMap<String, usize>,
-    keys: &mut std::collections::HashSet<String>,
-) -> String {
-    let mut key = match appearances.get_mut(path) {
-        Some(count) => {
-            *count += 1;
-            format!("{path}_{count}")
-        }
-        None => {
-            appearances.insert(path.to_string(), 0);
-            path.to_string()
-        }
-    };
-    // `keys` holds emitted keys only, matching the streaming parser's
-    // collision rule (it checks the values already in `tags`).
-    while keys.contains(&key) {
-        let count = appearances.get_mut(path).unwrap();
-        *count += 1;
-        key = format!("{path}_{count}");
-    }
-    key
-}
-
-/// Flatten an item's inner bytes into ordered `(key, value)` fields.
+/// Flatten an item's inner bytes, emitting one row per valid item.
 ///
-/// Returns `None` when the content is not well formed (the item is dropped).
-/// Leaf values borrow `content` where possible.
-pub fn parse_item_flat<'a>(content: &'a [u8], sep: &str) -> Option<Vec<(String, FlatVal<'a>)>> {
+/// Returns `None` when the content is malformed (the item is dropped whole,
+/// with nothing emitted). Empty / comment-only items are silently skipped.
+pub fn parse_item_flat_with<E: FlatEmitter>(
+    scratch: &mut Scratch,
+    content: &[u8],
+    sep: &str,
+    emitter: &mut E,
+) -> Option<()> {
+    scratch.stack.clear();
+    scratch.pending.clear();
+    scratch.appearances.clear();
+    scratch.emitted.clear();
+    scratch.key_arena.clear();
+
     let n = content.len();
     let mut i = 0usize;
-    let mut stack: Vec<TextFrame> = Vec::new();
-    let mut fields: Vec<(String, FlatVal<'_>)> = Vec::new();
-    let mut appearances: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut root = TextBuf::default();
     let mut seen_child = false;
 
     while i < n {
         if content[i] != b'<' {
-            let target = match stack.last_mut() {
+            let target = match scratch.stack.last_mut() {
                 Some(frame) => &mut frame.text,
                 None => &mut root,
             };
@@ -840,7 +915,7 @@ pub fn parse_item_flat<'a>(content: &'a [u8], sep: &str) -> Option<Vec<(String, 
             if has_forbidden_char(raw) {
                 return None;
             }
-            let target = match stack.last_mut() {
+            let target = match scratch.stack.last_mut() {
                 Some(frame) => &mut frame.text,
                 None => &mut root,
             };
@@ -857,7 +932,7 @@ pub fn parse_item_flat<'a>(content: &'a [u8], sep: &str) -> Option<Vec<(String, 
         }
 
         if i + 1 < n && content[i + 1] == b'/' {
-            if stack.is_empty() {
+            if scratch.stack.is_empty() {
                 return None;
             }
             let end = find_tag_end(content, i + 1)?;
@@ -866,15 +941,18 @@ pub fn parse_item_flat<'a>(content: &'a [u8], sep: &str) -> Option<Vec<(String, 
                 return None;
             }
             let name = end_tag_name(tag);
-            let frame = stack.pop().unwrap();
-            if name != frame.tag.as_bytes() {
+            let frame = scratch.stack.pop().unwrap();
+            if name != &content[frame.tag.0..frame.tag.1] {
                 return None;
             }
             i = end;
-            let text = frame.text.into_val(content);
-            if !frame.has_children || !text.trim_is_empty() {
-                keys.insert(frame.key.clone());
-                fields.push((frame.key, text));
+            let value = frame.text.into_pending();
+            if !frame.has_children || !pending_trim_is_empty(&value, content) {
+                scratch.emitted.push(frame.key);
+                scratch.pending.push(FlatPending {
+                    key: frame.key,
+                    value,
+                });
             }
             continue;
         }
@@ -885,49 +963,82 @@ pub fn parse_item_flat<'a>(content: &'a [u8], sep: &str) -> Option<Vec<(String, 
             return None;
         }
         let name = match start_tag_name(tag) {
-            Some(raw) => std::str::from_utf8(raw).ok()?.to_string(),
+            Some(raw) => std::str::from_utf8(raw).ok()?,
             None => return None,
         };
+        let tag_span = (i + 1, i + 1 + name.len());
         let self_closing = is_self_closing(tag);
-        let frame = if stack.is_empty() {
+        let key = if scratch.stack.is_empty() {
             seen_child = true;
-            TextFrame {
-                tag: name.clone(),
-                key: number_key(&name, &mut appearances, &mut keys),
-                text: TextBuf::default(),
-                has_children: false,
-            }
+            number_key(scratch, content, KeySrc::Content(tag_span.0, tag_span.1))
         } else {
-            stack.last_mut().unwrap().has_children = true;
-            // The implicit wrapper is not on the stack: any ancestor here
-            // prefixes the path.
-            let path = format!("{}/{}", stack.last().unwrap().key, name);
-            let key = number_key(&path, &mut appearances, &mut keys);
-            TextFrame {
-                tag: name,
-                key,
-                text: TextBuf::default(),
-                has_children: false,
-            }
+            scratch.stack.last_mut().unwrap().has_children = true;
+            let parent = scratch.stack.last().unwrap().key;
+            let path = nested_path(scratch, content, parent, tag_span)?;
+            number_key(scratch, content, path)
         };
         i = end;
-        stack.push(frame);
+        scratch.stack.push(FlatFrame {
+            tag: tag_span,
+            key,
+            text: TextBuf::default(),
+            has_children: false,
+        });
         if self_closing {
-            let frame = stack.pop().unwrap();
-            let text = frame.text.into_val(content);
-            if !frame.has_children || !text.trim_is_empty() {
-                keys.insert(frame.key.clone());
-                fields.push((frame.key, text));
+            let frame = scratch.stack.pop().unwrap();
+            let value = frame.text.into_pending();
+            if !frame.has_children || !pending_trim_is_empty(&value, content) {
+                scratch.emitted.push(frame.key);
+                scratch.pending.push(FlatPending {
+                    key: frame.key,
+                    value,
+                });
             }
         }
     }
 
-    if !stack.is_empty() {
+    if !scratch.stack.is_empty() {
         return None;
     }
+
     if !seen_child {
         // The implicit wrapper is a leaf (bare text or empty).
-        return Some(vec![(sep.to_string(), root.into_val(content))]);
+        let value = root.into_pending();
+        if pending_trim_is_empty(&value, content) {
+            return Some(());
+        }
+        emitter.row_start();
+        emitter.field(sep, pending_str(&value, content).trim_end_matches('\n'));
+        emitter.row_end();
+        return Some(());
     }
-    Some(fields)
+
+    if scratch.pending.is_empty() {
+        return Some(());
+    }
+    if scratch.pending.len() == 1 {
+        let p = &scratch.pending[0];
+        let key = key_slice(p.key, content, &scratch.key_arena);
+        if key == sep && pending_trim_is_empty(&p.value, content) {
+            return Some(());
+        }
+    }
+
+    let Scratch {
+        pending,
+        key_arena,
+        ..
+    } = scratch;
+    emitter.row_start();
+    for p in pending.iter() {
+        let name = match p.key {
+            KeySrc::Content(s, e) => {
+                unsafe { std::str::from_utf8_unchecked(&content[s..e]) }
+            }
+            KeySrc::Arena(s, e) => &key_arena[s as usize..(s + e) as usize],
+        };
+        emitter.field(name, &pending_str(&p.value, content).trim_end_matches('\n'));
+    }
+    emitter.row_end();
+    Some(())
 }

@@ -5,14 +5,65 @@
 //! columns the streaming parser produces, and skips items that do not parse.
 //! A trailing partial item is left alone: the engine discards it.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
+
 use rypipe_core::{ColumnarSink, RecordParser, Value};
 
 use crate::scan;
-use crate::xml;
+use crate::xml::{self, FlatEmitter, Scratch};
+
+// One reusable parse scratch per OS thread. The engine shares a single parser
+// across rayon workers (and clones it for streaming), so a parser-owned
+// `Mutex<Scratch>` would serialize every worker; a thread-local keeps the
+// buffers per worker with no contention.
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
 
 #[derive(Clone)]
 pub struct XmlParser {
     sep: Vec<u8>,
+}
+
+/// Emits one row per item, using the engine's layout-prediction fast path.
+struct RowEmitter<'a, S: ColumnarSink + ?Sized> {
+    sink: &'a mut S,
+    ordinal: u32,
+}
+
+impl<S: ColumnarSink + ?Sized> FlatEmitter for RowEmitter<'_, S> {
+    fn row_start(&mut self) {
+        self.sink.begin_row();
+        self.ordinal = 0;
+    }
+
+    fn field(&mut self, name: &str, value: &str) {
+        if !self.sink.wants(name) {
+            return;
+        }
+        let matched = self
+            .sink
+            .expect_slot(self.ordinal)
+            .map(|(slot, expected)| (slot, name.as_bytes() == expected));
+        match matched {
+            Some((slot, true)) => {
+                self.sink.put_field_at(slot, Value::Str(Cow::Borrowed(value)));
+            }
+            Some((_, false)) => {
+                self.sink.layout_broken(self.ordinal);
+                self.sink.put_field(name, Value::Str(Cow::Borrowed(value)));
+            }
+            None => {
+                self.sink.put_field(name, Value::Str(Cow::Borrowed(value)));
+            }
+        }
+        self.ordinal += 1;
+    }
+
+    fn row_end(&mut self) {
+        self.sink.end_row();
+    }
 }
 
 impl XmlParser {
@@ -24,6 +75,19 @@ impl XmlParser {
 
     fn parse_into<S: ColumnarSink + ?Sized>(&self, bytes: &[u8], sink: &mut S) {
         let sep = std::str::from_utf8(&self.sep).unwrap_or("item");
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            self.scan_and_emit(bytes, sep, &mut scratch, sink);
+        });
+    }
+
+    fn scan_and_emit<S: ColumnarSink + ?Sized>(
+        &self,
+        bytes: &[u8],
+        sep: &str,
+        scratch: &mut Scratch,
+        sink: &mut S,
+    ) {
         let mut i = 0usize;
         loop {
             let Some((start, after_open)) = scan::find_open_sep(bytes, i, &self.sep) else {
@@ -47,49 +111,12 @@ impl XmlParser {
                 continue;
             }
 
-            let Some(fields) = xml::parse_item_flat(content, sep) else {
-                // A malformed item is dropped alone; its neighbours stand.
-                continue;
+            let mut emitter = RowEmitter {
+                sink: &mut *sink,
+                ordinal: 0,
             };
-            if fields.is_empty() {
-                continue;
-            }
-            if fields.len() == 1
-                && fields[0].0 == sep
-                && fields[0].1.trim_is_empty()
-            {
-                continue;
-            }
-
-            sink.begin_row();
-            // Ordinal counts *kept* fields, matching the engine's
-            // `current_ordinal` (it does not advance for dropped fields).
-            let mut ordinal: u32 = 0;
-            for (name, value) in fields {
-                if !sink.wants(&name) {
-                    continue;
-                }
-                // Layout prediction: after row 1 the engine caches an
-                // ordinal -> (slot, name) map. A memcmp against the raw name
-                // lets us skip name resolution and a hash lookup entirely.
-                let matched = sink
-                    .expect_slot(ordinal)
-                    .map(|(slot, expected)| (slot, name.as_bytes() == expected));
-                match matched {
-                    Some((slot, true)) => {
-                        sink.put_field_at(slot, Value::Str(value.rstrip_newlines()));
-                    }
-                    Some((_, false)) => {
-                        sink.layout_broken(ordinal);
-                        sink.put_field(&name, Value::Str(value.rstrip_newlines()));
-                    }
-                    None => {
-                        sink.put_field(&name, Value::Str(value.rstrip_newlines()));
-                    }
-                }
-                ordinal += 1;
-            }
-            sink.end_row();
+            // A malformed item returns None and emits nothing (dropped whole).
+            let _ = xml::parse_item_flat_with(scratch, content, sep, &mut emitter);
         }
     }
 }
