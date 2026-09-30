@@ -857,6 +857,7 @@ dependencies = [
  "lz4_flex",
  "memchr",
  "memmap2",
+ "mimalloc",
  "rayon",
  "regex",
  "rustc-hash",
