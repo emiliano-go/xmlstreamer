@@ -1,10 +1,13 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 
-use rypipe_core::{MemoryBudget, ParallelStreamOpts, ParallelStreamingBatchIterator, Pipeline};
+use rypipe_core::{
+    MemoryBudget, ParallelStreamOpts, ParallelStreamingBatchIterator, ParseDiagnostics, Pipeline,
+    RecordStream as CoreRecordStream, StreamState,
+};
 use rypipe_python::{
     execution_plan_from_kwargs, py_err_from_rypipe, record_batch_to_pyarrow,
     record_batches_to_pyarrow_batches, record_batches_to_pyarrow_table,
@@ -13,12 +16,13 @@ use rypipe_python::{
 mod parser;
 mod scan;
 mod splitter;
+mod stream_parser;
 mod tokenizer;
 mod xml;
 
 use parser::XmlParser;
 use splitter::XmlSplitter;
-use tokenizer::{Log, Next};
+use stream_parser::{StreamRecord, XmlStreamParser};
 
 /// Parse a memory string ("64MiB", "1GB") or an int into bytes.
 fn memory_bytes(value: &Bound<'_, PyAny>) -> PyResult<usize> {
@@ -91,14 +95,43 @@ fn is_xml_name(raw: &[u8]) -> bool {
     xml::is_xml_name(raw)
 }
 
-/// Streaming item tokenizer backed by the rypipe-core scan primitives.
+/// Collects diagnostics from the streaming parser for Python to log.
+#[derive(Default)]
+struct DiagSink {
+    events: Mutex<Vec<(String, String)>>,
+    counters: Mutex<HashMap<String, usize>>,
+}
+
+impl ParseDiagnostics for DiagSink {
+    fn warning(&self, code: &str, message: &str) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((code.to_string(), message.to_string()));
+    }
+
+    fn counter(&self, name: &str, delta: usize) {
+        *self
+            .counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name.to_string())
+            .or_insert(0) += delta;
+    }
+}
+
+/// Incremental item stream: the rypipe `RecordStream` driver over the
+/// xmlstreamer scanner. `feed` pushes bytes; `next_item` returns
+/// `(2, item)`, `(1, None)` for need-more, `(0, None)` for EOF.
 #[pyclass]
-struct Tokenizer {
-    engine: tokenizer::Engine,
+struct RecordStream {
+    inner: CoreRecordStream<XmlStreamParser>,
+    diag: Arc<DiagSink>,
+    queue: VecDeque<StreamRecord>,
 }
 
 #[pymethods]
-impl Tokenizer {
+impl RecordStream {
     #[new]
     #[pyo3(signature = (separator_tag, buffer_size, max_section_size, on_limit_text, deadline_secs=None))]
     fn new(
@@ -108,107 +141,89 @@ impl Tokenizer {
         on_limit_text: bool,
         deadline_secs: Option<f64>,
     ) -> Self {
-        Tokenizer {
-            engine: tokenizer::Engine::new(
+        RecordStream {
+            inner: CoreRecordStream::new(XmlStreamParser::new(
                 separator_tag,
                 buffer_size,
                 max_section_size,
                 on_limit_text,
                 deadline_secs,
-            ),
+            )),
+            diag: Arc::new(DiagSink::default()),
+            queue: VecDeque::new(),
         }
     }
 
-    fn feed(&mut self, chunk: &[u8]) {
-        self.engine.feed(chunk);
+    fn feed(&mut self, chunk: &[u8]) -> PyResult<()> {
+        self.inner.feed(chunk).map_err(py_err_from_rypipe)
     }
 
     fn finish(&mut self) {
-        self.engine.finish();
-    }
-
-    fn state(&self) -> u8 {
-        match self.engine.state() {
-            tokenizer::State::SeekOpen => 0,
-            tokenizer::State::SeekClose => 1,
-            tokenizer::State::ItemParsed => 2,
-            tokenizer::State::Eof => 3,
-        }
+        self.inner.finish();
     }
 
     fn malformed_tags(&self) -> usize {
-        self.engine.malformed_tags()
+        self.inner.parser().malformed_tags()
     }
 
     /// Drain the warnings the scan produced since the last call.
-    fn take_logs<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    fn take_logs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
-        for log in self.engine.take_logs() {
-            match log {
-                Log::Unterminated {
-                    opener,
-                    limit,
-                    markup,
-                } => {
-                    list.append((
-                        "unterminated",
-                        PyBytes::new(py, &opener),
-                        limit,
-                        markup,
-                    ))?;
-                }
-                Log::MalformedTag { tag } => {
-                    list.append(("malformed_tag", PyBytes::new(py, &tag)))?;
-                }
-                Log::EndedInItem { discarded } => {
-                    list.append(("ended_in_item", discarded))?;
-                }
-                Log::SectionEof { opener, discarded } => {
-                    list.append((
-                        "section_eof",
-                        PyBytes::new(py, &opener),
-                        discarded,
-                    ))?;
-                }
-                Log::FeedTimeout => {
-                    list.append(("feed_timeout",))?;
-                }
-            }
+        let events = std::mem::take(
+            &mut *self.diag.events.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        for (code, message) in events {
+            list.append((code, message))?;
         }
         Ok(list)
     }
 
-    /// Return `(code, payload)`: 0 EOF, 1 need-more, 2 item.
-    fn next_item<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<(u8, Py<PyAny>)> {
-        match self.engine.next_item() {
-            Next::Eof => Ok((0, py.None())),
-            Next::NeedMore => Ok((1, py.None())),
-            Next::Item(item) => {
-                let parsed = match item.parsed {
-                    Some(tags) => {
-                        let dict = PyDict::new(py);
-                        for (key, value) in tags {
-                            dict.set_item(key, value)?;
-                        }
-                        Some(dict.unbind())
-                    }
-                    None => None,
-                };
-                let payload = (
-                    PyBytes::new(py, &item.content),
-                    parsed,
-                    item.replaced,
-                    item.collisions,
-                );
-                let payload_obj: Py<PyAny> =
-                    payload.into_pyobject(py)?.unbind().into_any();
-                Ok((2, payload_obj))
+    fn next_item<'py>(&mut self, py: Python<'py>) -> PyResult<(u8, Py<PyAny>)> {
+        loop {
+            if let Some(record) = self.queue.pop_front() {
+                return Ok((2, record_to_py(py, record)?));
+            }
+            // The parser can finish on its own (time budget exhausted) while
+            // the driver still has bytes to pull: end the iteration there.
+            if self.inner.parser().state_eof() {
+                return Ok((0, py.None()));
+            }
+            let mut out: Vec<StreamRecord> = Vec::new();
+            let state = self
+                .inner
+                .parse(&mut |record| out.push(record), &*self.diag)
+                .map_err(py_err_from_rypipe)?;
+            self.queue.extend(out);
+            let has_queued = !self.queue.is_empty();
+            match state {
+                StreamState::Eof if has_queued => continue,
+                StreamState::Eof => return Ok((0, py.None())),
+                StreamState::NeedMore if has_queued => continue,
+                StreamState::NeedMore => return Ok((1, py.None())),
+                StreamState::Rows => continue,
             }
         }
     }
+}
+
+fn record_to_py(py: Python<'_>, record: StreamRecord) -> PyResult<Py<PyAny>> {
+    let parsed = match record.parsed {
+        Some(tags) => {
+            let dict = PyDict::new(py);
+            for (key, value) in tags {
+                dict.set_item(key, value)?;
+            }
+            Some(dict.unbind())
+        }
+        None => None,
+    };
+    let payload = (
+        PyBytes::new(py, &record.content),
+        parsed,
+        record.replaced,
+        record.collisions,
+    );
+    Ok(payload.into_pyobject(py)?.unbind().into_any())
 }
 
 #[pyfunction]
@@ -490,6 +505,6 @@ fn _xmlstreamer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_xml_stream, m)?)?;
     m.add_function(wrap_pyfunction!(iter_xml_batches_par, m)?)?;
     m.add_class::<ParallelBatches>()?;
-    m.add_class::<Tokenizer>()?;
+    m.add_class::<RecordStream>()?;
     Ok(())
 }

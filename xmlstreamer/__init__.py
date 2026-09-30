@@ -1145,7 +1145,9 @@ class Tokenizer:
         remaining = (
             None if deadline is None else max(0.0, deadline - time.monotonic())
         )
-        self._engine = _xmlstreamer.Tokenizer(
+        # The rypipe `RecordStream` driver over the xmlstreamer scanner. The
+        # warnings are already formatted in Rust; Python only logs them.
+        self._engine = _xmlstreamer.RecordStream(
             separator_tag,
             buffer_size,
             sections.max_size,
@@ -1160,46 +1162,10 @@ class Tokenizer:
         return self._engine.malformed_tags()
 
     def _log_engine_events(self) -> None:
-        for event in self._engine.take_logs():
-            kind = event[0]
-            if kind == "unterminated":
-                _, opener, limit, markup = event
-                logger.warning(
-                    "Unterminated %s after %s bytes: %s.",
-                    opener,
-                    limit,
-                    "discarding whatever follows it"
-                    if markup
-                    else "reading it as text, not markup",
-                )
-            elif kind == "malformed_tag":
-                _, tag = event
-                logger.warning(
-                    "Malformed separator tag %r: the item is delivered "
-                    "(its content parses), but the feed is not well-formed "
-                    "here.",
-                    bytes(tag),
-                )
-            elif kind == "ended_in_item":
-                _, discarded = event
-                logger.warning(
-                    "Feed ended inside an item: %s bytes discarded "
-                    "(the download was cut, or the last item is unclosed).",
-                    discarded,
-                )
-            elif kind == "section_eof":
-                _, opener, discarded = event
-                logger.warning(
-                    "Feed ended inside %s that never closed: %s bytes "
-                    "discarded.",
-                    opener,
-                    discarded,
-                )
-            elif kind == "feed_timeout":
-                logger.warning(
-                    "> XMLStreamer > Time budget exhausted while reading "
-                    "the feed: stopping."
-                )
+        for _code, message in self._engine.take_logs():
+            # The messages are formatted in Rust to match the historical
+            # Python warnings byte for byte.
+            logger.warning("%s", message)
 
     def get_item(self) -> Optional[ParsedItem]:
         while True:
