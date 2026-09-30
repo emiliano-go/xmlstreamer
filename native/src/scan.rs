@@ -47,8 +47,8 @@ fn find_tag_end(bytes: &[u8], from: usize) -> Option<usize> {
         match bytes[i] {
             b'>' => return Some(i + 1),
             b'"' | b'\'' => {
-                let close = memchr::memchr(bytes[i], &bytes[i + 1..])?;
-                i = i + 1 + close + 1;
+                let close = rypipe_core::scan::find(bytes, i + 1, bytes[i])?;
+                i = close + 1;
             }
             _ => i += 1,
         }
@@ -65,8 +65,7 @@ pub fn find_open_sep(bytes: &[u8], from: usize, sep: &[u8]) -> Option<(usize, us
     let n = bytes.len();
     let mut i = from;
     while i < n {
-        let lt = memchr::memchr(b'<', &bytes[i..])?;
-        let p = i + lt;
+        let p = rypipe_core::scan::find(bytes, i, b'<')?;
         if let Some((terminator, header)) = section_at(bytes, p) {
             match find_seq(bytes, p + header, terminator) {
                 Some(end) => {
@@ -96,8 +95,7 @@ pub fn find_close_sep(bytes: &[u8], from: usize, sep: &[u8]) -> Option<(usize, u
     let n = bytes.len();
     let mut i = from;
     while i < n {
-        let lt = memchr::memchr(b'<', &bytes[i..])?;
-        let p = i + lt;
+        let p = rypipe_core::scan::find(bytes, i, b'<')?;
         if let Some((terminator, header)) = section_at(bytes, p) {
             match find_seq(bytes, p + header, terminator) {
                 Some(end) => {
@@ -112,8 +110,8 @@ pub fn find_close_sep(bytes: &[u8], from: usize, sep: &[u8]) -> Option<(usize, u
             && &bytes[p + 2..p + 2 + sep.len()] == sep
         {
             let q = p + 2 + sep.len();
-            if let Some(r) = memchr::memchr(b'>', &bytes[q..]) {
-                return Some((p, q + r + 1));
+            if let Some(gt) = rypipe_core::scan::find(bytes, q, b'>') {
+                return Some((p, gt + 1));
             }
             return None;
         }
