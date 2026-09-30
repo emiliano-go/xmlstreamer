@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "xmlstreamer"
-dynamic = ["version"]
+version = "2.0.0"
 description = "Stream large or malformed XML feeds from HTTP, HTTPS or FTP without loading them into memory."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -49,19 +49,18 @@ dev = [
   "pytest>=8",
 ]
 
-# The dynamic version lives in the module: rebuild the editable install
-# when that file changes, not only on pyproject changes (uv's default).
+# The parsing engine is a Rust extension built on rypipe-core. Rebuild the
+# editable install when the native sources change.
 [tool.uv]
 cache-keys = [
   { file = "pyproject.toml" },
-  { file = "xmlstreamer/__init__.py" }
+  { file = "xmlstreamer/__init__.py" },
+  { file = "native/Cargo.toml" },
+  { file = "native/src/**/*.rs" },
 ]
 
-[tool.setuptools.dynamic]
-version = { attr = "xmlstreamer.__version__" }
-
-[tool.setuptools.packages.find]
-include = ["xmlstreamer*"]
-
-[tool.setuptools.package-data]
-xmlstreamer = ["py.typed"]
+[tool.maturin]
+manifest-path = "native/Cargo.toml"
+module-name = "xmlstreamer._xmlstreamer"
+python-source = "."
+features = ["pyo3/extension-module"]

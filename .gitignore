@@ -165,3 +165,6 @@ Thumbs.db
 
 # UV:
 uv.lock
+
+# Rust build artifacts for the rypipe-backed engine:
+native/target/

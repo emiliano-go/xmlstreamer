@@ -19,6 +19,8 @@ import requests
 
 import re
 
+from . import _xmlstreamer
+
 from io import BufferedRandom
 
 from enum import Enum
@@ -846,29 +848,24 @@ def parse_item(item_string: bytes) -> Optional[Dict[str, Any]]:
 
 
 def parse_sanitized_item(decoded_string: bytes) -> Optional[Dict[str, Any]]:
-    handler = ItemHandler()
-    parser = expat.ParserCreate()
-    parser.buffer_text = True
-    parser.EntityDeclHandler = _forbid_entity_constructs
-    parser.UnparsedEntityDeclHandler = _forbid_entity_constructs
-    parser.ExternalEntityRefHandler = _forbid_entity_constructs
-    parser.StartElementHandler = handler.startElement
-    parser.EndElementHandler = handler.endElement
-    parser.CharacterDataHandler = handler.characters
-    try:
-        parser.Parse(decoded_string, True)
-    except Exception as exc:
+    # The per-item parse runs in the Rust engine (rypipe/quick scan), in
+    # isolation, exactly as the fresh expat parser used to. Malformed bytes
+    # invalidate this item alone; nothing else is ever seen by the parse.
+    parsed, collisions = _xmlstreamer.parse_document(decoded_string)
+    for taken, tag, key in collisions:
+        logger.warning(
+            "Key collision on %r: <%s> numbered as %r instead. A field "
+            "named like a numbered sibling makes the shape ambiguous.",
+            taken, tag, key,
+        )
+    if parsed is None:
         logger.warning(
             "Discarding unparseable item (%s): %r",
-            exc,
+            "malformed XML",
             decoded_string[:120],
         )
         return None
-
-    for k in handler.tags.keys():
-        handler.tags[k] = handler.tags[k].rstrip("\n")
-
-    return handler.tags
+    return parsed
 
 
 NESTED_TEXT_KEY = "#text"
