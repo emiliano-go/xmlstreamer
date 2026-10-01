@@ -45,6 +45,16 @@ pub fn is_xml_name(raw: &[u8]) -> bool {
     if raw.is_empty() {
         return false;
     }
+    // ASCII fast path: most names never touch the Unicode tables.
+    if raw.iter().all(|b| b.is_ascii()) {
+        let first = raw[0];
+        if !(first.is_ascii_alphabetic() || first == b'_' || first == b':') {
+            return false;
+        }
+        return raw[1..].iter().all(|&b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-' | b'.')
+        });
+    }
     let s = match std::str::from_utf8(raw) {
         Ok(s) => s,
         Err(_) => return false,
@@ -85,6 +95,13 @@ fn char_ref_code(digits: &str, base: u32) -> i64 {
 }
 
 fn has_forbidden_char(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // ASCII fast path: forbidden means a C0 control other than tab/LF/CR.
+    if bytes.iter().all(|b| *b < 0x80) {
+        return bytes
+            .iter()
+            .any(|&b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r');
+    }
     s.chars().any(|c| !is_xml_char(c as i64))
 }
 
@@ -93,6 +110,12 @@ fn has_forbidden_char(s: &str) -> bool {
 pub fn attvalue_is_well_formed(value: &[u8]) -> bool {
     if value.contains(&b'<') {
         return false;
+    }
+    // ASCII fast path with no entity reference: only control chars are illegal.
+    if value.iter().all(|b| *b < 0x80) && !value.contains(&b'&') {
+        return !value
+            .iter()
+            .any(|&b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r');
     }
     let text = match std::str::from_utf8(value) {
         Ok(t) => t,
