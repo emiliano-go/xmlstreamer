@@ -913,81 +913,116 @@ fn read_text_run(content: &[u8], mut i: usize, target: &mut TextBuf) -> Option<u
     Some(i)
 }
 
-/// Flatten an item's inner bytes, emitting one row per valid item.
+/// Result of parsing one item in place (fused scan + parse).
+pub enum Fused {
+    /// The item was handled; resume scanning just past its close tag.
+    Complete { resume: usize },
+    /// The item's close tag is not in these bytes (partial trailing record).
+    Incomplete,
+    /// The item is malformed; the caller resyncs and drops it.
+    Malformed,
+}
+
+/// Parse one item starting just past its opening separator tag, emitting a row
+/// for it, and return where scanning resumes.
 ///
-/// Returns `None` when the content is malformed (the item is dropped whole,
-/// with nothing emitted). Empty / comment-only items are silently skipped.
-pub fn parse_item_flat_with<E: FlatEmitter>(
+/// Locating the `</sep>` is fused with field parsing: the item's bytes are
+/// walked once. A malformed item emits nothing; the caller resyncs with
+/// `find_close_sep` and drops it, matching the streaming parser.
+pub fn parse_item_fused<E: FlatEmitter>(
     scratch: &mut Scratch,
-    content: &[u8],
+    bytes: &[u8],
+    start: usize,
     sep: &str,
     keep: Option<&std::collections::HashSet<String>>,
     emitter: &mut E,
-) -> Option<()> {
+) -> Fused {
     scratch.stack.clear();
     scratch.pending.clear();
     scratch.appearances.clear();
     scratch.emitted.clear();
     scratch.key_arena.clear();
 
-    let n = content.len();
-    let mut i = 0usize;
+    let n = bytes.len();
+    let mut i = start;
     let mut root = TextBuf::default();
     let mut seen_child = false;
 
     while i < n {
-        if content[i] != b'<' {
+        if bytes[i] != b'<' {
             let target = match scratch.stack.last_mut() {
                 Some(frame) => &mut frame.text,
                 None => &mut root,
             };
-            i = read_text_run(content, i, target)?;
+            match read_text_run(bytes, i, target) {
+                Some(next) => i = next,
+                None => return Fused::Malformed,
+            }
             continue;
         }
 
-        if content[i..].starts_with(b"<!--") {
-            i = find_seq(content, i + 4, b"-->")? + 3;
+        if bytes[i..].starts_with(b"<!--") {
+            i = match find_seq(bytes, i + 4, b"-->") {
+                Some(end) => end + 3,
+                None => return Fused::Incomplete,
+            };
             continue;
         }
-        if content[i..].starts_with(b"<![CDATA[") {
-            let end = find_seq(content, i + 9, b"]]>")?;
-            let raw = std::str::from_utf8(&content[i + 9..end]).ok()?;
+        if bytes[i..].starts_with(b"<![CDATA[") {
+            let end = match find_seq(bytes, i + 9, b"]]>") {
+                Some(end) => end,
+                None => return Fused::Incomplete,
+            };
+            let raw = match std::str::from_utf8(&bytes[i + 9..end]) {
+                Ok(s) => s,
+                Err(_) => return Fused::Malformed,
+            };
             if has_forbidden_char(raw) {
-                return None;
+                return Fused::Malformed;
             }
             let target = match scratch.stack.last_mut() {
                 Some(frame) => &mut frame.text,
                 None => &mut root,
             };
-            target.push_run(content, i + 9, end);
+            target.push_run(bytes, i + 9, end);
             i = end + 3;
             continue;
         }
-        if content[i..].starts_with(b"<?") {
-            i = find_seq(content, i + 2, b"?>")? + 2;
+        if bytes[i..].starts_with(b"<?") {
+            i = match find_seq(bytes, i + 2, b"?>") {
+                Some(end) => end + 2,
+                None => return Fused::Incomplete,
+            };
             continue;
         }
-        if content[i..].starts_with(b"<!") {
-            return None;
+        if bytes[i..].starts_with(b"<!") {
+            return Fused::Malformed;
         }
 
-        if i + 1 < n && content[i + 1] == b'/' {
-            if scratch.stack.is_empty() {
-                return None;
-            }
-            let end = find_tag_end(content, i + 1)?;
-            let tag = &content[i..end];
+        if i + 1 < n && bytes[i + 1] == b'/' {
+            let end = match find_tag_end(bytes, i + 1) {
+                Some(end) => end,
+                None => return Fused::Incomplete,
+            };
+            let tag = &bytes[i..end];
             if !end_tag_is_well_formed(tag) {
-                return None;
+                return Fused::Malformed;
             }
             let name = end_tag_name(tag);
+            if scratch.stack.is_empty() {
+                if name != sep.as_bytes() {
+                    return Fused::Malformed;
+                }
+                i = end;
+                return finish_item(scratch, bytes, sep, &mut root, seen_child, emitter, i);
+            }
             let frame = scratch.stack.pop().unwrap();
-            if name != &content[frame.tag.0..frame.tag.1] {
-                return None;
+            if name != &bytes[frame.tag.0..frame.tag.1] {
+                return Fused::Malformed;
             }
             i = end;
             let value = frame.text.into_pending();
-            if !frame.has_children || !pending_trim_is_empty(&value, content) {
+            if !frame.has_children || !pending_trim_is_empty(&value, bytes) {
                 scratch.emitted.push(frame.key);
                 scratch.pending.push(FlatPending {
                     key: frame.key,
@@ -997,40 +1032,45 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
             continue;
         }
 
-        let end = find_tag_end(content, i + 1)?;
-        let tag = &content[i..end];
+        let end = match find_tag_end(bytes, i + 1) {
+            Some(end) => end,
+            None => return Fused::Incomplete,
+        };
+        let tag = &bytes[i..end];
         if !start_tag_is_well_formed(tag) {
-            return None;
+            return Fused::Malformed;
         }
         let name = match start_tag_name(tag) {
-            Some(raw) => std::str::from_utf8(raw).ok()?,
-            None => return None,
+            Some(raw) => match std::str::from_utf8(raw) {
+                Ok(s) => s,
+                Err(_) => return Fused::Malformed,
+            },
+            None => return Fused::Malformed,
         };
         let tag_span = (i + 1, i + 1 + name.len());
         let self_closing = is_self_closing(tag);
 
         // Projection pushdown: a depth-1, first-occurrence, pure-text leaf
-        // whose column is unwanted can be skipped without scanning its value.
-        // Numbering state is kept (appearances records the occurrence) so
-        // later siblings still number the same as the streaming parser.
+        // whose column is unwanted is skipped without scanning its value;
+        // numbering state is kept so later siblings number as before.
         if scratch.stack.is_empty() && !self_closing && !emitter.wants(name) {
             let path = KeySrc::Content(tag_span.0, tag_span.1);
             let first = !scratch
                 .appearances
                 .iter()
-                .any(|(k, _)| key_eq(*k, path, content, &scratch.key_arena))
+                .any(|(k, _)| key_eq(*k, path, bytes, &scratch.key_arena))
                 && !scratch
                     .emitted
                     .iter()
-                    .any(|k| key_eq(*k, path, content, &scratch.key_arena));
+                    .any(|k| key_eq(*k, path, bytes, &scratch.key_arena));
             if first {
-                if let Some(lt) = rypipe_core::scan::find(content, end, b'<') {
+                if let Some(lt) = rypipe_core::scan::find(bytes, end, b'<') {
                     let after = lt + 2;
-                    let tag_bytes = &content[tag_span.0..tag_span.1];
-                    if content.get(lt..lt + 2) == Some(b"</")
+                    let tag_bytes = &bytes[tag_span.0..tag_span.1];
+                    if bytes.get(lt..lt + 2) == Some(b"</")
                         && after + tag_bytes.len() + 1 <= n
-                        && &content[after..after + tag_bytes.len()] == tag_bytes
-                        && content[after + tag_bytes.len()] == b'>'
+                        && &bytes[after..after + tag_bytes.len()] == tag_bytes
+                        && bytes[after + tag_bytes.len()] == b'>'
                     {
                         scratch.appearances.push((path, 0));
                         i = after + tag_bytes.len() + 1;
@@ -1041,18 +1081,16 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
         }
 
         // Projection pushdown: under a declared schema, a depth-1 subtree with
-        // no wanted descendant is skipped whole. Its numbering slot is still
-        // consumed so a later same-name sibling numbers as the streaming
-        // parser would.
+        // no wanted descendant is skipped whole.
         if scratch.stack.is_empty() && !self_closing {
             if let Some(keep) = keep {
                 if !subtree_wanted(keep, name) {
                     if let Some(after) =
-                        crate::scan::skip_element(content, end, name.as_bytes())
+                        crate::scan::skip_element(bytes, end, name.as_bytes())
                     {
                         let _ = number_key(
                             scratch,
-                            content,
+                            bytes,
                             KeySrc::Content(tag_span.0, tag_span.1),
                         );
                         i = after;
@@ -1064,12 +1102,15 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
 
         let key = if scratch.stack.is_empty() {
             seen_child = true;
-            number_key(scratch, content, KeySrc::Content(tag_span.0, tag_span.1))
+            number_key(scratch, bytes, KeySrc::Content(tag_span.0, tag_span.1))
         } else {
             scratch.stack.last_mut().unwrap().has_children = true;
             let parent = scratch.stack.last().unwrap().key;
-            let path = nested_path(scratch, content, parent, tag_span)?;
-            number_key(scratch, content, path)
+            let path = match nested_path(scratch, bytes, parent, tag_span) {
+                Some(p) => p,
+                None => return Fused::Malformed,
+            };
+            number_key(scratch, bytes, path)
         };
         i = end;
         scratch.stack.push(FlatFrame {
@@ -1081,7 +1122,7 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
         if self_closing {
             let frame = scratch.stack.pop().unwrap();
             let value = frame.text.into_pending();
-            if !frame.has_children || !pending_trim_is_empty(&value, content) {
+            if !frame.has_children || !pending_trim_is_empty(&value, bytes) {
                 scratch.emitted.push(frame.key);
                 scratch.pending.push(FlatPending {
                     key: frame.key,
@@ -1091,30 +1132,38 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
         }
     }
 
-    if !scratch.stack.is_empty() {
-        return None;
-    }
+    Fused::Incomplete
+}
 
+/// Finish a completed item: emit its row unless it is empty / comment-only.
+fn finish_item<E: FlatEmitter>(
+    scratch: &mut Scratch,
+    bytes: &[u8],
+    sep: &str,
+    root: &mut TextBuf,
+    seen_child: bool,
+    emitter: &mut E,
+    resume: usize,
+) -> Fused {
     if !seen_child {
-        // The implicit wrapper is a leaf (bare text or empty).
-        let value = root.into_pending();
-        if pending_trim_is_empty(&value, content) {
-            return Some(());
+        let value = std::mem::take(root).into_pending();
+        if pending_trim_is_empty(&value, bytes) {
+            return Fused::Complete { resume };
         }
         emitter.row_start();
-        emitter.field(sep, pending_str(&value, content).trim_end_matches('\n'));
+        emitter.field(sep, pending_str(&value, bytes).trim_end_matches('\n'));
         emitter.row_end();
-        return Some(());
+        return Fused::Complete { resume };
     }
 
     if scratch.pending.is_empty() {
-        return Some(());
+        return Fused::Complete { resume };
     }
     if scratch.pending.len() == 1 {
         let p = &scratch.pending[0];
-        let key = key_slice(p.key, content, &scratch.key_arena);
-        if key == sep && pending_trim_is_empty(&p.value, content) {
-            return Some(());
+        let key = key_slice(p.key, bytes, &scratch.key_arena);
+        if key == sep && pending_trim_is_empty(&p.value, bytes) {
+            return Fused::Complete { resume };
         }
     }
 
@@ -1126,13 +1175,13 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
     emitter.row_start();
     for p in pending.iter() {
         let name = match p.key {
-            KeySrc::Content(s, e) => {
-                unsafe { std::str::from_utf8_unchecked(&content[s..e]) }
-            }
+            KeySrc::Content(s, e) => unsafe {
+                std::str::from_utf8_unchecked(&bytes[s..e])
+            },
             KeySrc::Arena(s, e) => &key_arena[s as usize..(s + e) as usize],
         };
-        emitter.field(name, &pending_str(&p.value, content).trim_end_matches('\n'));
+        emitter.field(name, &pending_str(&p.value, bytes).trim_end_matches('\n'));
     }
     emitter.row_end();
-    Some(())
+    Fused::Complete { resume }
 }

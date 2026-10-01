@@ -184,33 +184,37 @@ impl XmlParser {
                 i = after_open;
                 continue;
             }
-            let Some((close_start, after_close)) =
-                scan::find_close_sep(bytes, after_open, &self.sep)
-            else {
-                // The item is incomplete in this chunk: the engine drops the
-                // trailing partial row.
-                break;
-            };
-            let content = &bytes[after_open..close_start];
-            i = after_close;
-
-            if content.is_empty() || content.iter().all(|&b| scan::is_ws(b)) {
-                continue;
-            }
 
             let mut emitter = RowEmitter {
                 sink: &mut *sink,
                 types: &self.types,
                 ordinal: 0,
             };
-            // A malformed item returns None and emits nothing (dropped whole).
-            let _ = xml::parse_item_flat_with(
+            // Fused scan + parse: one pass over the item's bytes. A malformed
+            // item emits nothing; resync on its close tag and drop it.
+            match xml::parse_item_fused(
                 scratch,
-                content,
+                bytes,
+                after_open,
                 sep,
                 self.keep.as_ref(),
                 &mut emitter,
-            );
+            ) {
+                xml::Fused::Complete { resume } => {
+                    i = resume;
+                }
+                xml::Fused::Incomplete => {
+                    // The item is incomplete in this chunk: the engine drops
+                    // the trailing partial row.
+                    break;
+                }
+                xml::Fused::Malformed => {
+                    match scan::find_close_sep(bytes, after_open, &self.sep) {
+                        Some((_close, after_close)) => i = after_close,
+                        None => break,
+                    }
+                }
+            }
         }
     }
 }
