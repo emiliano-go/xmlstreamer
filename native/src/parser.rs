@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rypipe_core::{ColumnarSink, RecordParser, Value};
 
@@ -38,6 +38,11 @@ pub fn field_kinds(types: Option<HashMap<String, String>>) -> HashMap<String, Fi
             Some((name, kind))
         })
         .collect()
+}
+
+/// The declared projection as a lookup set (schema_order), or None.
+pub fn keep_set(schema: Option<&Vec<String>>) -> Option<HashSet<String>> {
+    schema.map(|names| names.iter().cloned().collect())
 }
 
 fn typed_value<'a>(kind: FieldKind, value: &'a str) -> Value<'a> {
@@ -72,6 +77,9 @@ thread_local! {
 pub struct XmlParser {
     sep: Vec<u8>,
     types: HashMap<String, FieldKind>,
+    // Declared projection (schema_order): depth-1 subtrees with no wanted
+    // descendant are skipped whole.
+    keep: Option<HashSet<String>>,
 }
 
 /// Emits one row per item, using the engine's layout-prediction fast path.
@@ -132,10 +140,15 @@ impl<S: ColumnarSink + ?Sized> FlatEmitter for RowEmitter<'_, S> {
 }
 
 impl XmlParser {
-    pub fn new(separator_tag: &str, types: HashMap<String, FieldKind>) -> Self {
+    pub fn new(
+        separator_tag: &str,
+        types: HashMap<String, FieldKind>,
+        keep: Option<HashSet<String>>,
+    ) -> Self {
         Self {
             sep: separator_tag.as_bytes().to_vec(),
             types,
+            keep,
         }
     }
 
@@ -183,7 +196,13 @@ impl XmlParser {
                 ordinal: 0,
             };
             // A malformed item returns None and emits nothing (dropped whole).
-            let _ = xml::parse_item_flat_with(scratch, content, sep, &mut emitter);
+            let _ = xml::parse_item_flat_with(
+                scratch,
+                content,
+                sep,
+                self.keep.as_ref(),
+                &mut emitter,
+            );
         }
     }
 }

@@ -192,6 +192,64 @@ pub fn find_close_sep(bytes: &[u8], from: usize, sep: &[u8]) -> Option<(usize, u
     None
 }
 
+/// Skip the element named `tag` whose opening tag ends at `after_open`,
+/// returning the index just past its matching close tag.
+///
+/// Nested same-name elements are depth-counted; sections and quoted attribute
+/// values are skipped. `None` when the element does not close in these bytes.
+pub fn skip_element(bytes: &[u8], after_open: usize, tag: &[u8]) -> Option<usize> {
+    let n = bytes.len();
+    let mut depth = 1usize;
+    let mut i = after_open;
+    while i < n {
+        let p = rypipe_core::scan::find(bytes, i, b'<')?;
+        match section_end(bytes, p) {
+            Section::End(end) => {
+                i = end;
+                continue;
+            }
+            Section::Unterminated => return None,
+            Section::No => {}
+        }
+        if bytes.get(p + 1) == Some(&b'/') {
+            let q = p + 2;
+            if q + tag.len() <= n && &bytes[q..q + tag.len()] == tag {
+                let z = q + tag.len();
+                if matches!(bytes.get(z), Some(b'>') | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r'))
+                {
+                    depth -= 1;
+                    let end = find_tag_end(bytes, p + 1)?;
+                    if depth == 0 {
+                        return Some(end);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        } else if p + 1 + tag.len() <= n && &bytes[p + 1..p + 1 + tag.len()] == tag {
+            let z = p + 1 + tag.len();
+            match bytes.get(z) {
+                Some(b'>') => {
+                    depth += 1;
+                    i = z + 1;
+                    continue;
+                }
+                Some(&b) if is_ws(b) => {
+                    let end = find_tag_end(bytes, p + 1)?;
+                    if !is_self_closing(&bytes[p..end]) {
+                        depth += 1;
+                    }
+                    i = end;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i = p + 1;
+    }
+    None
+}
+
 /// Whether an opening separator tag (`<sep ...>`) is self-closing (`<sep/>`).
 #[inline]
 pub fn is_self_closing(open_tag: &[u8]) -> bool {

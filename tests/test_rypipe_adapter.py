@@ -258,6 +258,45 @@ def test_source_parallel_streaming_via_iter_record_batches(tmp_path):
     assert rows == [{"n": str(i)} for i in range(2000)]
 
 
+_NESTED_FEED = (
+    b"<item><title>A</title><location><city>V</city>"
+    b"<country>AA</country></location></item>"
+)
+
+
+@pytest.mark.parametrize(
+    "schema,expected",
+    [
+        (["title"], [{"title": "A"}]),
+        (["location/city"], [{"location/city": "V"}]),
+        (["title", "location/city"], [{"title": "A", "location/city": "V"}]),
+        (
+            ["location/country"],
+            [{"location/country": "AA"}],
+        ),
+    ],
+)
+def test_schema_projection_skips_unwanted_subtrees(tmp_path, schema, expected):
+    path = _write(tmp_path, _NESTED_FEED)
+    # columnar and parallel
+    assert _xmlstreamer.read_xml(
+        path, separator_tag="item", schema=schema
+    ).to_pylist() == expected
+    assert _xmlstreamer.read_xml_par(
+        path, separator_tag="item", schema=schema, chunks=2
+    ).to_pylist() == expected
+
+
+def test_schema_projection_numbered_parents_kept(tmp_path):
+    feed = (
+        b"<item><group><v>1</v></group><group><v>2</v></group></item>"
+    )
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed), separator_tag="item", schema=["group/v"]
+    )
+    assert table.to_pylist() == [{"group/v": "1"}]
+
+
 def test_field_types_emit_typed_values(tmp_path):
     feed = (
         b"<feed><item><id>1</id><year>1998</year></item>"

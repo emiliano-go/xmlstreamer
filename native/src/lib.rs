@@ -251,6 +251,7 @@ fn read_xml(
     use_mmap: bool,
     prefault: bool,
 ) -> PyResult<Py<PyAny>> {
+    let keep = parser::keep_set(schema.as_ref());
     let types = parser::field_kinds(field_types.clone());
     let plan = execution_plan_from_kwargs(
         field_mapping,
@@ -270,7 +271,7 @@ fn read_xml(
         .detach(|| {
             Pipeline::new(
                 XmlSplitter::new(&separator_tag),
-                XmlParser::new(&separator_tag, types),
+                XmlParser::new(&separator_tag, types, keep),
             )
             .with_plan(plan)
             .read_path(&path, use_mmap, prefault)
@@ -305,6 +306,7 @@ fn read_xml_par(
     use_mmap: bool,
     prefault: bool,
 ) -> PyResult<Py<PyAny>> {
+    let keep = parser::keep_set(schema.as_ref());
     let types = parser::field_kinds(field_types.clone());
     let plan = execution_plan_from_kwargs(
         field_mapping,
@@ -324,7 +326,7 @@ fn read_xml_par(
         .detach(|| {
             Pipeline::new(
                 XmlSplitter::new(&separator_tag),
-                XmlParser::new(&separator_tag, types),
+                XmlParser::new(&separator_tag, types, keep),
             )
             .with_plan(plan)
             .read_path_par(&path, chunks, use_mmap, prefault)
@@ -365,6 +367,7 @@ fn read_xml_stream(
         Some(value) => MemoryBudget::new(memory_bytes(&value)?),
         None => MemoryBudget::new(64 * 1024 * 1024),
     };
+    let keep = parser::keep_set(schema.as_ref());
     let types = parser::field_kinds(field_types.clone());
     let plan = execution_plan_from_kwargs(
         field_mapping,
@@ -384,7 +387,7 @@ fn read_xml_stream(
         .detach(|| {
             Pipeline::new(
                 XmlSplitter::new(&separator_tag),
-                XmlParser::new(&separator_tag, types),
+                XmlParser::new(&separator_tag, types, keep),
             )
             .with_plan(plan)
             .read_path_stream(&path, budget, prefault)
@@ -462,6 +465,7 @@ fn iter_xml_batches_par(
         Some(value) => MemoryBudget::new(memory_bytes(&value)?),
         None => MemoryBudget::new(64 * 1024 * 1024),
     };
+    let keep = parser::keep_set(schema.as_ref());
     let types = parser::field_kinds(field_types.clone());
     let plan = execution_plan_from_kwargs(
         field_mapping,
@@ -486,7 +490,7 @@ fn iter_xml_batches_par(
     let inner = ParallelStreamingBatchIterator::new(
         std::path::PathBuf::from(&path),
         XmlSplitter::new(&separator_tag),
-        XmlParser::new(&separator_tag, types),
+        XmlParser::new(&separator_tag, types, keep),
         Arc::new(plan),
         budget,
         prefault,
