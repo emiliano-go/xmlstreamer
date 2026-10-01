@@ -88,6 +88,9 @@ pub struct XmlParser {
     // Declared projection (schema_order): depth-1 subtrees with no wanted
     // descendant are skipped whole.
     keep: Option<HashSet<String>>,
+    // Strict validates attribute values / text characters; fast (opt-in)
+    // validates only element names and structure.
+    strict: bool,
 }
 
 /// Emits one row per item, using the engine's layout-prediction fast path.
@@ -152,11 +155,13 @@ impl XmlParser {
         separator_tag: &str,
         types: HashMap<String, FieldKind>,
         keep: Option<HashSet<String>>,
+        strict: bool,
     ) -> Self {
         Self {
             sep: separator_tag.as_bytes().to_vec(),
             types,
             keep,
+            strict,
         }
     }
 
@@ -198,6 +203,7 @@ impl XmlParser {
                 after_open,
                 sep,
                 self.keep.as_ref(),
+                self.strict,
                 &mut emitter,
             ) {
                 xml::Fused::Complete { resume } => {

@@ -343,6 +343,22 @@ def test_field_types_unparseable_value_is_null(tmp_path):
     assert table.to_pylist() == [{"id": 1, "year": None}]
 
 
+@pytest.mark.parametrize("name,feed,sep,expected", CASES, ids=[c[0] for c in CASES])
+def test_fast_validation_matches_strict_on_wellformed(
+    tmp_path, name, feed, sep, expected
+):
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed), separator_tag=sep, validate="fast"
+    )
+    assert table.to_pylist() == expected
+
+
+def test_validate_rejects_unknown_mode(tmp_path):
+    path = _write(tmp_path, b"<feed><item><t>x</t></item></feed>")
+    with pytest.raises(ValueError):
+        _xmlstreamer.read_xml(path, separator_tag="item", validate="bogus")
+
+
 def test_min_chunk_bytes_knob_is_accepted(tmp_path):
     feed = build_feed([{"n": str(i)} for i in range(1000)])
     path = _write(tmp_path, feed)

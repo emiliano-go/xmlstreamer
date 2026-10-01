@@ -891,7 +891,12 @@ fn nested_path(
     Some(KeySrc::Arena(off, len))
 }
 
-fn read_text_run(content: &[u8], mut i: usize, target: &mut TextBuf) -> Option<usize> {
+fn read_text_run(
+    content: &[u8],
+    mut i: usize,
+    strict: bool,
+    target: &mut TextBuf,
+) -> Option<usize> {
     let n = content.len();
     while i < n && content[i] != b'<' {
         if content[i] == b'&' {
@@ -905,7 +910,7 @@ fn read_text_run(content: &[u8], mut i: usize, target: &mut TextBuf) -> Option<u
             i += 1;
         }
         let run = std::str::from_utf8(&content[start..i]).ok()?;
-        if has_forbidden_char(run) {
+        if strict && has_forbidden_char(run) {
             return None;
         }
         target.push_run(content, start, i);
@@ -935,6 +940,7 @@ pub fn parse_item_fused<E: FlatEmitter>(
     start: usize,
     sep: &str,
     keep: Option<&std::collections::HashSet<String>>,
+    strict: bool,
     emitter: &mut E,
 ) -> Fused {
     scratch.stack.clear();
@@ -954,7 +960,7 @@ pub fn parse_item_fused<E: FlatEmitter>(
                 Some(frame) => &mut frame.text,
                 None => &mut root,
             };
-            match read_text_run(bytes, i, target) {
+            match read_text_run(bytes, i, strict, target) {
                 Some(next) => i = next,
                 None => return Fused::Malformed,
             }
@@ -977,7 +983,7 @@ pub fn parse_item_fused<E: FlatEmitter>(
                 Ok(s) => s,
                 Err(_) => return Fused::Malformed,
             };
-            if has_forbidden_char(raw) {
+            if strict && has_forbidden_char(raw) {
                 return Fused::Malformed;
             }
             let target = match scratch.stack.last_mut() {
@@ -1037,7 +1043,14 @@ pub fn parse_item_fused<E: FlatEmitter>(
             None => return Fused::Incomplete,
         };
         let tag = &bytes[i..end];
-        if !start_tag_is_well_formed(tag) {
+        let tag_ok = if strict {
+            start_tag_is_well_formed(tag)
+        } else {
+            // Fast mode: validate the element name, skip attribute-value
+            // well-formedness (a trusted-feed optimization).
+            start_tag_name(tag).is_some()
+        };
+        if !tag_ok {
             return Fused::Malformed;
         }
         let name = match start_tag_name(tag) {
