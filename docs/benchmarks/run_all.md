@@ -6,28 +6,28 @@ Date: 2026-09-30 | CPU: 13th Gen Intel(R) Core(TM) i5-1335U | Python 3.13.13 | x
 
 | feed | parser | items | seconds | items/s |
 |---|---|---|---|---|
-| plain | xmlstreamer | 100,000 | 0.455 | 219,946 |
-| plain | lxml iterparse (recover=True) | 100,000 | 0.516 | 193,981 |
-| plain | stdlib ElementTree iterparse | 100,000 | 0.385 | 259,698 |
-| plain | xmltodict | 100,000 | 1.247 | 80,173 |
-| plain | xmltodict (streaming mode) | 100,000 | 1.303 | 76,773 |
-| cdata | xmlstreamer | 50,000 | 0.250 | 200,368 |
-| cdata | lxml iterparse (recover=True) | 50,000 | 0.335 | 149,184 |
-| cdata | stdlib ElementTree iterparse | 50,000 | 0.231 | 216,789 |
-| cdata | xmltodict | 50,000 | 0.705 | 70,873 |
-| cdata | xmltodict (streaming mode) | 50,000 | 0.677 | 73,865 |
-| plain | xmlstreamer end-to-end (HTTP) | 100,000 | 0.534 | 187,389 |
+| plain | xmlstreamer | 100,000 | 0.382 | 261,698 |
+| plain | lxml iterparse (recover=True) | 100,000 | 0.370 | 269,970 |
+| plain | stdlib ElementTree iterparse | 100,000 | 0.391 | 255,714 |
+| plain | xmltodict | 100,000 | 1.228 | 81,440 |
+| plain | xmltodict (streaming mode) | 100,000 | 1.108 | 90,240 |
+| cdata | xmlstreamer | 50,000 | 0.323 | 154,961 |
+| cdata | lxml iterparse (recover=True) | 50,000 | 0.490 | 102,006 |
+| cdata | stdlib ElementTree iterparse | 50,000 | 0.216 | 231,527 |
+| cdata | xmltodict | 50,000 | 0.666 | 75,103 |
+| cdata | xmltodict (streaming mode) | 50,000 | 0.644 | 77,580 |
+| plain | xmlstreamer end-to-end (HTTP) | 100,000 | 0.417 | 240,091 |
 
 ## Peak memory (one subprocess per parser, RSS)
 
 | parser | feed MB | peak RSS MB | items | seconds |
 |---|---|---|---|---|
 | (python + imports baseline) | 121 | 16 | 0 | 0.00 |
-| xmlstreamer | 121 | 73 | 900,000 | 4.40 |
-| lxml iterparse (recover=True) | 121 | 24 | 900,000 | 3.69 |
-| stdlib ElementTree iterparse | 121 | 17 | 900,000 | 3.82 |
-| xmltodict (streaming mode) | 121 | 22 | 900,000 | 11.37 |
-| xmltodict | 121 | 443 | 900,000 | 12.90 |
+| xmlstreamer | 121 | 73 | 900,000 | 4.80 |
+| lxml iterparse (recover=True) | 121 | 24 | 900,000 | 4.77 |
+| stdlib ElementTree iterparse | 121 | 17 | 900,000 | 4.80 |
+| xmltodict (streaming mode) | 121 | 22 | 900,000 | 11.71 |
+| xmltodict | 121 | 443 | 900,000 | 11.46 |
 
 ## Dirty-feed gauntlet (what each parser does to broken input)
 
