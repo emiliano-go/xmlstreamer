@@ -119,6 +119,33 @@ def _projection(path: str) -> int:
 _PROJ_SCHEMA = ["id"]
 
 
+def _stdlib(path: str) -> int:
+    import xml.etree.ElementTree as ET
+
+    count = 0
+    iterator = ET.iterparse(open(path, "rb"), events=("start", "end"))
+    _, root = next(iterator)
+    for event, element in iterator:
+        if event == "end" and element.tag == "item":
+            count += 1
+            root.clear()
+    return count
+
+
+def _lxml(path: str) -> int:
+    from lxml import etree
+
+    count = 0
+    for _, element in etree.iterparse(
+        open(path, "rb"), events=("end",), tag="item", recover=True
+    ):
+        count += 1
+        element.clear(keep_tail=True)
+        while element.getprevious() is not None:
+            del element.getparent()[0]
+    return count
+
+
 def _columnar_proj(path: str) -> int:
     from xmlstreamer import _xmlstreamer
 
@@ -156,6 +183,8 @@ ENGINES: Dict[str, Callable] = {
     "rypipe columnar drop4": _projection,
     "rypipe columnar proj1": _columnar_proj,
     "rypipe par8 proj1": _par_proj(8),
+    "stdlib ET iterparse": _stdlib,
+    "lxml iterparse (recover)": _lxml,
 }
 
 
