@@ -57,11 +57,19 @@ fn typed_value<'a>(kind: FieldKind, value: &'a str) -> Value<'a> {
             .parse::<f64>()
             .map(Value::Float64)
             .unwrap_or(Value::Str(Cow::Borrowed(value))),
-        FieldKind::Bool => match value.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Value::Bool(true),
-            "false" | "0" | "no" => Value::Bool(false),
-            _ => Value::Str(Cow::Borrowed(value)),
-        },
+        FieldKind::Bool => {
+            let t = value.trim();
+            if t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes") {
+                Value::Bool(true)
+            } else if t == "0"
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+            {
+                Value::Bool(false)
+            } else {
+                Value::Str(Cow::Borrowed(value))
+            }
+        }
     }
 }
 

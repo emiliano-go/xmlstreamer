@@ -26,19 +26,51 @@ class XmlSource(Adapter):
     ``filter``, ``use_mmap``, ...).
     """
 
-    __slots__ = ("_separator_tag",)
+    __slots__ = ("_separator_tag", "_engine_mode", "_threads")
 
     def __init__(
         self,
         path,
         *,
         separator_tag: str = "item",
+        engine: str = "columnar",
+        threads: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         self._separator_tag = separator_tag
+        self._engine_mode = engine
+        self._threads = threads
         super().__init__(path, **kwargs)
 
+    def _resolve_mode(self, path: str, mode: str, threads: Optional[int]) -> str:
+        if mode != "auto":
+            return mode
+        import os
+
+        from rypipe import resolve_engine
+
+        resolved = resolve_engine(
+            file_size=os.path.getsize(path),
+            threads=threads,
+            schema=self._schema or None,
+            has_parallel=True,
+            has_columnar=True,
+        )
+        # `read` returns a table, so the streaming modes map to parallel.
+        return "parallel" if resolved in ("parallel", "parallel_streaming") else "columnar"
+
     def read(self, path: str, **kwargs: Any) -> pa.Table:
+        mode = kwargs.pop("engine", self._engine_mode)
+        threads = kwargs.pop("threads", self._threads)
+        chunks = kwargs.pop("chunks", None)
+        mode = self._resolve_mode(path, mode, threads)
+        if mode == "parallel" or (mode == "columnar" and threads and threads > 1):
+            return _xmlstreamer.read_xml_par(
+                str(path),
+                separator_tag=self._separator_tag,
+                chunks=chunks or threads or 8,
+                **kwargs,
+            )
         return _xmlstreamer.read_xml(
             str(path), separator_tag=self._separator_tag, **kwargs
         )

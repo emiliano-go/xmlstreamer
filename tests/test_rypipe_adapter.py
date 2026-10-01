@@ -196,6 +196,20 @@ def test_source_pipeline_and_sinks(tmp_path):
     assert result.schema.field("n").type == pa.int64()
 
 
+def test_source_engine_dispatch(tmp_path):
+    feed = build_feed([{"n": str(i)} for i in range(100)])
+    path = _write(tmp_path, feed)
+    expected = [{"n": str(i)} for i in range(100)]
+    for kwargs in (
+        {"engine": "columnar"},
+        {"engine": "parallel", "threads": 2},
+        {"engine": "auto", "threads": 4},
+        {"threads": 3},
+    ):
+        source = XmlSource(path, separator_tag="item", **kwargs)
+        assert source.to_arrow().to_pylist() == expected
+
+
 def test_source_streaming_iter_record_batches(tmp_path):
     feed = build_feed([{"n": str(i)} for i in range(2000)])
     source = XmlSource(_write(tmp_path, feed), separator_tag="item")

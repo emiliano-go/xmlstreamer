@@ -230,7 +230,7 @@ fn record_to_py(py: Python<'_>, record: StreamRecord) -> PyResult<Py<PyAny>> {
 #[pyo3(signature = (path, separator_tag="item".to_string(), field_mapping=None, drop_fields=None,
     filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false,
     auto_dict_threshold=None, auto_dict_max_size=None, strict_types=false,
-    max_split_chunks=None, observer=None, use_mmap=false, prefault=false))]
+    max_split_chunks=None, observer=None, use_mmap=true, prefault=false))]
 #[allow(clippy::too_many_arguments)]
 fn read_xml(
     py: Python<'_>,
