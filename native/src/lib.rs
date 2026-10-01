@@ -166,6 +166,16 @@ impl RecordStream {
         self.inner.parser().malformed_tags()
     }
 
+    /// Whether any warning is pending (cheap; avoids building a list per item).
+    fn has_logs(&self) -> bool {
+        !self
+            .diag
+            .events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
     /// Drain the warnings the scan produced since the last call.
     fn take_logs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);

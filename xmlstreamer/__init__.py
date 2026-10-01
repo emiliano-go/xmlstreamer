@@ -1162,6 +1162,9 @@ class Tokenizer:
         return self._engine.malformed_tags()
 
     def _log_engine_events(self) -> None:
+        # Warnings are rare; skip the list allocation on the common path.
+        if not self._engine.has_logs():
+            return
         for _code, message in self._engine.take_logs():
             # The messages are formatted in Rust to match the historical
             # Python warnings byte for byte.
