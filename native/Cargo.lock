@@ -848,7 +848,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "rypipe-core"
 version = "0.4.0"
-source = "git+https://github.com/emiliano-go/rypipe?rev=08ae3f395d1a0440922729fae04bb089387a519b#08ae3f395d1a0440922729fae04bb089387a519b"
+source = "git+https://github.com/emiliano-go/rypipe?rev=55ed2c3#55ed2c315cedca94d9569f984711ffbe2e1a822a"
 dependencies = [
  "arrow",
  "chrono",
@@ -870,7 +870,7 @@ dependencies = [
 [[package]]
 name = "rypipe-python"
 version = "0.4.0"
-source = "git+https://github.com/emiliano-go/rypipe?rev=08ae3f395d1a0440922729fae04bb089387a519b#08ae3f395d1a0440922729fae04bb089387a519b"
+source = "git+https://github.com/emiliano-go/rypipe?rev=55ed2c3#55ed2c315cedca94d9569f984711ffbe2e1a822a"
 dependencies = [
  "arrow",
  "mimalloc",

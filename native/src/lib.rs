@@ -240,7 +240,7 @@ fn record_to_py(py: Python<'_>, record: StreamRecord) -> PyResult<Py<PyAny>> {
 #[pyo3(signature = (path, separator_tag="item".to_string(), field_mapping=None, drop_fields=None,
     filter=None, field_types=None, dictionary_columns=None, schema=None, auto_dict=false,
     auto_dict_threshold=None, auto_dict_max_size=None, strict_types=false,
-    max_split_chunks=None, observer=None, use_mmap=true, prefault=false))]
+    max_split_chunks=None, min_chunk_bytes=None, observer=None, use_mmap=true, prefault=false))]
 #[allow(clippy::too_many_arguments)]
 fn read_xml(
     py: Python<'_>,
@@ -257,6 +257,7 @@ fn read_xml(
     auto_dict_max_size: Option<usize>,
     strict_types: bool,
     max_split_chunks: Option<usize>,
+    min_chunk_bytes: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
     use_mmap: bool,
     prefault: bool,
@@ -275,6 +276,7 @@ fn read_xml(
         auto_dict_max_size,
         strict_types,
         max_split_chunks,
+        min_chunk_bytes,
         observer.as_ref(),
     )?;
     let batch = py
@@ -294,7 +296,7 @@ fn read_xml(
 #[pyo3(signature = (path, separator_tag="item".to_string(), chunks=4, field_mapping=None,
     drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None,
     auto_dict=false, auto_dict_threshold=None, auto_dict_max_size=None, strict_types=false,
-    max_split_chunks=None, observer=None, use_mmap=true, prefault=false))]
+    max_split_chunks=None, min_chunk_bytes=None, observer=None, use_mmap=true, prefault=false))]
 #[allow(clippy::too_many_arguments)]
 fn read_xml_par(
     py: Python<'_>,
@@ -312,6 +314,7 @@ fn read_xml_par(
     auto_dict_max_size: Option<usize>,
     strict_types: bool,
     max_split_chunks: Option<usize>,
+    min_chunk_bytes: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
     use_mmap: bool,
     prefault: bool,
@@ -330,6 +333,7 @@ fn read_xml_par(
         auto_dict_max_size,
         strict_types,
         max_split_chunks,
+        min_chunk_bytes,
         observer.as_ref(),
     )?;
     let batches = py
@@ -350,7 +354,7 @@ fn read_xml_par(
 #[pyo3(signature = (path, separator_tag="item".to_string(), memory=None, field_mapping=None,
     drop_fields=None, filter=None, field_types=None, dictionary_columns=None, schema=None,
     auto_dict=false, auto_dict_threshold=None, auto_dict_max_size=None, strict_types=false,
-    max_split_chunks=None, observer=None, use_mmap=true, prefault=false))]
+    max_split_chunks=None, min_chunk_bytes=None, observer=None, use_mmap=true, prefault=false))]
 #[allow(clippy::too_many_arguments)]
 fn read_xml_stream(
     py: Python<'_>,
@@ -368,6 +372,7 @@ fn read_xml_stream(
     auto_dict_max_size: Option<usize>,
     strict_types: bool,
     max_split_chunks: Option<usize>,
+    min_chunk_bytes: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
     use_mmap: bool,
     prefault: bool,
@@ -391,6 +396,7 @@ fn read_xml_stream(
         auto_dict_max_size,
         strict_types,
         max_split_chunks,
+        min_chunk_bytes,
         observer.as_ref(),
     )?;
     let batches = py
@@ -446,7 +452,7 @@ impl ParallelBatches {
 #[pyo3(signature = (path, separator_tag="item".to_string(), threads=8, memory=None,
     ordered=true, field_mapping=None, drop_fields=None, filter=None, field_types=None,
     dictionary_columns=None, schema=None, auto_dict=false, auto_dict_threshold=None,
-    auto_dict_max_size=None, strict_types=false, max_split_chunks=None, observer=None,
+    auto_dict_max_size=None, strict_types=false, max_split_chunks=None, min_chunk_bytes=None, observer=None,
     use_mmap=true, prefault=false))]
 #[allow(clippy::too_many_arguments)]
 fn iter_xml_batches_par(
@@ -466,6 +472,7 @@ fn iter_xml_batches_par(
     auto_dict_max_size: Option<usize>,
     strict_types: bool,
     max_split_chunks: Option<usize>,
+    min_chunk_bytes: Option<usize>,
     observer: Option<Bound<'_, PyAny>>,
     use_mmap: bool,
     prefault: bool,
@@ -489,6 +496,7 @@ fn iter_xml_batches_par(
         auto_dict_max_size,
         strict_types,
         max_split_chunks,
+        min_chunk_bytes,
         observer.as_ref(),
     )?;
     let opts = ParallelStreamOpts {

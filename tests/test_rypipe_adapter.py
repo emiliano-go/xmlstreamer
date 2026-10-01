@@ -343,6 +343,17 @@ def test_field_types_unparseable_value_is_null(tmp_path):
     assert table.to_pylist() == [{"id": 1, "year": None}]
 
 
+def test_min_chunk_bytes_knob_is_accepted(tmp_path):
+    feed = build_feed([{"n": str(i)} for i in range(1000)])
+    path = _write(tmp_path, feed)
+    assert _xmlstreamer.read_xml(
+        path, separator_tag="item", min_chunk_bytes=64 * 1024
+    ).num_rows == 1000
+    assert _xmlstreamer.read_xml_par(
+        path, separator_tag="item", chunks=4, min_chunk_bytes=64 * 1024
+    ).num_rows == 1000
+
+
 def test_projection_drop_fields(tmp_path):
     feed = build_feed([{"t": "a", "n": "1"}, {"t": "b", "n": "2"}])
     table = _xmlstreamer.read_xml(
