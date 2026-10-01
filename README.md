@@ -54,7 +54,9 @@ Install with uv or pip:
 uv add xmlstreamer        # or: pip install xmlstreamer
 ```
 
-Requires Python 3.10 or newer.
+Requires Python 3.10 or newer. The parsing engine is a Rust extension
+(built on [rypipe-core](https://crates.io/crates/rypipe-core)): prebuilt wheels
+need no toolchain, but building from source needs a Rust toolchain (1.78+).
 
 ## Usage
 
@@ -73,6 +75,31 @@ for item in interpreter:
 That is the whole program: gzip, character encodings and malformed items are handled by default, and the feed is never loaded whole into memory. Tuning knobs (`buffer_size`, `max_running_time`, `Transport`, filters, nested output) exist when you need them and are documented below.
 
 The interpreter is reusable configuration; iterating it opens a run (`FeedRun`) that owns one pass over the feed. Runs are independent, so nested loops and retries over the same interpreter are ordinary code, and the interpreter answers for the last one through `last_run` and the `stats_*` properties.
+
+### Columnar and parallel ingestion (rypipe adapter)
+
+For local files, the same Rust engine also exposes a columnar/parallel API built
+on [rypipe](https://github.com/emiliano-go/rypipe), producing Arrow tables:
+
+```python
+from xmlstreamer import XmlSource, CastTypes, FilterRows, col
+
+table = XmlSource("feed.xml", separator_tag="item").to_arrow()
+
+df = (
+    XmlSource("feed.xml", separator_tag="item", schema=["id", "title"])
+    | CastTypes({"id": int})
+    | FilterRows(col("title").is_not_null())
+).to_pandas()
+
+for batch in XmlSource("big.xml", separator_tag="item").iter_record_batches(threads=8):
+    writer.write_batch(batch)
+```
+
+`XmlSource` follows the rypipe adapter contract (`schema`, `field_types`,
+`drop_fields`, `filter`, `engine`/`threads`, `memory`), and importing
+`xmlstreamer` registers it so `rypipe.read("feed.xml", separator_tag="item")`
+works too.
 
 ## Command line
 
@@ -100,34 +127,63 @@ The useful flags mirror the API: `--mode stream` (no temp file), `--nested` (nes
 
 ## Performance
 
-Honest numbers against the obvious alternatives. Everything below comes from the reproducible harness in [`benchmarks/`](benchmarks/README.md), and a single command re-measures all of it on your machine:
+Honest numbers against the obvious alternatives. Everything comes from the
+reproducible harness in [`benchmarks/`](benchmarks/README.md); one command
+re-measures it on your machine:
 
 ```bash
 uv run --group bench python benchmarks/run_all.py
+uv run --group bench python benchmarks/bench_rypipe.py --feed-mb 100
 ```
 
-*Measured 2026-08-08 on an i5-1135G7, Python 3.14.6, lxml 6.1.1, xmltodict 1.0.4. Absolute numbers track the machine; the ratios are stable across runs.*
+*Measured 2026-10-01 on an i5-1335U, Python 3.13, lxml 6.1.3, xmltodict 1.0.4.
+Absolute numbers track the machine; the ratios are stable across runs.*
 
-**Speed.** Parse-only throughput: every parser consumes the same in-memory bytes, and each cell keeps the best of 7 interleaved rounds, so CPU frequency drift hits everyone equally.
+The engine is Rust. The per-item streaming API (`StreamInterpreter`) keeps the
+recovery semantics; the adapter API (`XmlSource`) adds Arrow, projection and
+parallelism. The streaming API used to be ~3.5x slower than the stdlib; it is now
+on par with it.
+
+**Speed (per-item API).** Parse-only throughput over the same in-memory bytes,
+best of N interleaved rounds:
 
 | feed | xmlstreamer | lxml iterparse (recover=True) | stdlib ET iterparse | xmltodict |
 |---|---|---|---|---|
-| flat items | 90k items/s | 251k (2.8x faster) | 204k (2.3x faster) | 60k (slower) |
-| CDATA-heavy | 61k items/s | 111k (1.8x faster) | 124k (2.0x faster) | 51k (slower) |
+| flat items | 204k items/s | 166k | 184k | 59k |
+| CDATA-heavy | 182k items/s | 144k | 201k | 66k |
 
-lxml is the speed king. If your feeds are always well-formed, correctly declared and never truncated, use lxml. The next two tables are about what happens when they are not.
+**Columnar / parallel adapter.** Same 128 MiB file, every parser reading it:
 
-**Peak memory.** Each parser processes the same 121 MB feed alone, in a fresh subprocess, and reports its peak RSS: the highest amount of physical RAM the process ever occupied while running - measured by the kernel, not estimated.
+| engine | throughput | peak RSS |
+|---|---|---|
+| XmlSource columnar | 105 MB/s | 310 MB |
+| XmlSource parallel (8 threads) | 457 MB/s | 283 MB |
+| XmlSource bounded parallel streaming | 376 MB/s | 146 MB |
+| XmlSource projected (`schema=[...]`) | 251 MB/s | 217 MB |
+| XmlSource projected, 8 threads | 975 MB/s | 213 MB |
+| stdlib ET iterparse | 40 MB/s | 18 MB |
+| lxml iterparse (recover=True) | 47 MB/s | 25 MB |
+
+For bulk local ingestion the adapter is roughly 2.5x stdlib single-threaded,
+~10x in parallel, and ~25x when a projection lets the scanner skip unwanted
+fields. Parallel and bounded modes are where the engine pays off; the per-item
+API is for feeds that arrive over the network or need the recovery contract.
+
+**Peak memory.** Each parser processes the same 121 MB feed alone, in a fresh
+subprocess, and reports its peak RSS - measured by the kernel, not estimated.
 
 | parser | peak RSS |
 |---|---|
-| xmlstreamer | 31 MB - flat: identical on a 5 MB and a 121 MB feed |
-| lxml iterparse | 25 MB |
-| stdlib ET iterparse | 18 MB |
-| xmltodict (streaming mode) | 23 MB |
-| xmltodict (as commonly used) | 444 MB - grows with the feed |
+| xmlstreamer per-item | 73 MB |
+| XmlSource bounded streaming | 146 MB |
+| lxml iterparse | 24 MB |
+| stdlib ET iterparse | 17 MB |
+| xmltodict (streaming mode) | 22 MB |
+| xmltodict (as commonly used) | 443 MB - grows with the feed |
 
-Encoding detection only runs when the first 64 KiB are not already valid UTF-8, so the common case never pays for it; legacy-encoded feeds add a transient detection peak at startup. Either way the number does not grow with the feed - whole-document parsing (the last row) does.
+Encoding detection only runs when the first 64 KiB are not already valid UTF-8,
+so the common case never pays for it. The bounded modes stay flat as the feed
+grows; the columnar/parallel modes hold the materialized table.
 
 **Broken feeds.** This table is the reason the library exists: what each parser does when the input is damaged. The cells summarize verdicts generated by code, not written by hand - run the harness for the full, unabridged table.
 
@@ -139,7 +195,11 @@ Encoding detection only runs when the first 64 KiB are not already valid UTF-8, 
 | download truncated mid-item | delivers intact items only | emits the truncated fragment as a real item | feed lost |
 | separator tag nested in itself | unsupported (documented contract) | parses it | parses it |
 
-lxml and the stdlib win the first table by 2-3x; xmlstreamer is the only column with no silent failure in the last one. That trade is the point of the library: tens of thousands of items per second is more than a feed pipeline typically needs, and damaged input is never repaired into records that were not in the feed. What the library cannot decode or cannot read as markup is reported, never passed off as data.
+lxml and the stdlib are fast, but xmlstreamer is the only column with no silent
+failure in the broken-feed table. That is the point of the library: damaged input
+is never repaired into records that were not in the feed, and what cannot be
+decoded or read as markup is reported, never passed off as data. The adapter API
+adds the raw throughput without giving that up.
 
 ## Transport: authentication, proxies, timeouts
 
