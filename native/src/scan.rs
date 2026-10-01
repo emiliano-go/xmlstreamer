@@ -80,6 +80,18 @@ fn skip_doctype(bytes: &[u8], start: usize) -> Option<usize> {
 /// Classify the markup section opening at `start` (comments, CDATA, PIs,
 /// DOCTYPE declarations).
 pub fn section_end(bytes: &[u8], start: usize) -> Section {
+    // Almost every `<` is an ordinary start tag: bail on the second byte
+    // before the four full prefix compares are reached.
+    match bytes.get(start + 1) {
+        Some(b'!') => {}
+        Some(b'?') => {
+            return match find_seq(bytes, start + 2, b"?>") {
+                Some(end) => Section::End(end + 2),
+                None => Section::Unterminated,
+            };
+        }
+        _ => return Section::No,
+    }
     let rest = match bytes.get(start..) {
         Some(r) => r,
         None => return Section::No,
@@ -93,12 +105,6 @@ pub fn section_end(bytes: &[u8], start: usize) -> Section {
     if rest.starts_with(b"<![CDATA[") {
         return match find_seq(bytes, start + 9, b"]]>") {
             Some(end) => Section::End(end + 3),
-            None => Section::Unterminated,
-        };
-    }
-    if rest.starts_with(b"<?") {
-        return match find_seq(bytes, start + 2, b"?>") {
-            Some(end) => Section::End(end + 2),
             None => Section::Unterminated,
         };
     }

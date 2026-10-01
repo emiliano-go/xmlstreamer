@@ -986,28 +986,6 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
         let tag_span = (i + 1, i + 1 + name.len());
         let self_closing = is_self_closing(tag);
 
-        // Projection pushdown: under a declared schema, a depth-1 subtree with
-        // no wanted descendant is skipped whole. Its numbering slot is still
-        // consumed so a later same-name sibling numbers as the streaming
-        // parser would.
-        if scratch.stack.is_empty() && !self_closing {
-            if let Some(keep) = keep {
-                if !subtree_wanted(keep, name) {
-                    if let Some(after) =
-                        crate::scan::skip_element(content, end, name.as_bytes())
-                    {
-                        let _ = number_key(
-                            scratch,
-                            content,
-                            KeySrc::Content(tag_span.0, tag_span.1),
-                        );
-                        i = after;
-                        continue;
-                    }
-                }
-            }
-        }
-
         // Projection pushdown: a depth-1, first-occurrence, pure-text leaf
         // whose column is unwanted can be skipped without scanning its value.
         // Numbering state is kept (appearances records the occurrence) so
@@ -1033,6 +1011,28 @@ pub fn parse_item_flat_with<E: FlatEmitter>(
                     {
                         scratch.appearances.push((path, 0));
                         i = after + tag_bytes.len() + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Projection pushdown: under a declared schema, a depth-1 subtree with
+        // no wanted descendant is skipped whole. Its numbering slot is still
+        // consumed so a later same-name sibling numbers as the streaming
+        // parser would.
+        if scratch.stack.is_empty() && !self_closing {
+            if let Some(keep) = keep {
+                if !subtree_wanted(keep, name) {
+                    if let Some(after) =
+                        crate::scan::skip_element(content, end, name.as_bytes())
+                    {
+                        let _ = number_key(
+                            scratch,
+                            content,
+                            KeySrc::Content(tag_span.0, tag_span.1),
+                        );
+                        i = after;
                         continue;
                     }
                 }
