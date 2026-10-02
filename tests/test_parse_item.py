@@ -359,3 +359,32 @@ def test_numbering_without_collisions_is_unchanged(caplog):
         parsed = parse_item(b"<item><x>a</x><x>b</x><x>c</x></item>")
     assert parsed == {"x": "a", "x_1": "b", "x_2": "c"}
     assert caplog.text == ""
+
+
+def test_crlf_and_cr_are_normalized():
+    # XML 1.0 §2.11: literal line ends normalize to "\n" before parsing.
+    assert parse_item(b"<item><t>a\r\nb</t></item>") == {"t": "a\nb"}
+    assert parse_item(b"<item><t>a\rb</t></item>") == {"t": "a\nb"}
+    assert parse_item(b"<item><t>trailing\r\n</t></item>") == {"t": "trailing"}
+
+
+def test_character_references_are_exempt_from_newline_normalization():
+    assert parse_item(b"<item><t>a&#13;b</t></item>") == {"t": "a\rb"}
+
+
+def test_leading_bom_is_ignored():
+    assert parse_item(b"\xef\xbb\xbf<item><t>x</t></item>") == {"t": "x"}
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        b"<item><t>x]]>y</t></item>",
+        b"<item><!-- a -- b --><t>x</t></item>",
+        b"<item><?xml version='1.0'?><t>x</t></item>",
+        b"<item><?1pi x?><t>x</t></item>",
+        b"<item><t a='&bogus;'>x</t></item>",
+    ],
+)
+def test_malformed_constructs_drop_the_item(doc):
+    assert parse_item(doc) is None

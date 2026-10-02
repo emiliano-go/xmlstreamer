@@ -856,3 +856,50 @@ def test_valid_chars_and_references_stay_quiet(value, caplog):
         items = drain(make_tokenizer(data))
     assert titles(items) == ["x"]
     assert caplog.text == ""
+
+
+# --- chunk-boundary regressions: the same bytes must give the same items --- #
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 7, 64, 4096])
+def test_comment_with_quote_split_at_chunk_boundary(chunk_size):
+    # `<!--` on a refill boundary plus an apostrophe in the comment used to
+    # swallow the rest of the feed at small chunk sizes.
+    data = (
+        b"<feed><item><t>x</t></item><!-- don't <item><t>fake</t></item> -->"
+        b"<item><t>real</t></item></feed>"
+    )
+    items = drain(make_tokenizer(data, buffer_size=16, chunk_size=chunk_size))
+    assert titles(items) == ["x", "real"]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 7, 64, 4096])
+def test_quoted_lt_split_at_chunk_boundary(chunk_size):
+    # A `<` inside a quoted attribute value is not a tag start, even when it
+    # lands on the last byte of a chunk.
+    data = (
+        b"<feed><item a='" + b"x" * 60 + b"<" + b"'>"
+        b"<t>real</t></item></feed>"
+    )
+    items = drain(make_tokenizer(data, buffer_size=16, chunk_size=chunk_size))
+    assert titles(items) == ["real"]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 64, 4096])
+def test_unclosed_open_quote_does_not_swallow_later_items(chunk_size):
+    # The byte scanner cannot know an unclosed quote is not part of a tag;
+    # with the historical read-ahead refreshed it resyncs like the legacy
+    # engine did beyond the tiny-buffer regime.
+    data = (
+        b'<feed><item note="never><t>a</t></item>'
+        b"<item><t>b</t></item></feed>"
+    )
+    items = drain(make_tokenizer(data, buffer_size=128, chunk_size=chunk_size))
+    assert titles(items) == ["b"]
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 64, 4096])
+def test_junk_in_close_tag_still_delivers_the_item(chunk_size):
+    data = b"<feed><item><t>a</t></item junk><item><t>b</t></item></feed>"
+    items = drain(make_tokenizer(data, buffer_size=16, chunk_size=chunk_size))
+    assert titles(items) == ["a", "b"]

@@ -417,3 +417,189 @@ def test_projection_matches_legacy(tmp_path, feed, sep, drops, expected):
         _write(tmp_path, feed), separator_tag=sep, drop_fields=drops
     )
     assert table.to_pylist() == expected
+
+
+# --- regressions: chunk/section correctness across every engine --- #
+
+DAMAGED_CASES = [
+    # junk in the closing tag still delivers the item (scanner contract)
+    (
+        b"<feed><item><t>a</t></item junk><item><t>b</t></item></feed>",
+        [{"t": "a"}, {"t": "b"}],
+    ),
+    # an opening quote that never closes must not swallow later items
+    (
+        b'<feed><item note="never><t>a</t></item><item><t>b</t></item></feed>',
+        [{"t": "b"}],
+    ),
+    # invalid utf-8 is replaced, like the streaming parser
+    (b"<feed><item><t>a\xffb</t></item></feed>", [{"t": "a\ufffdb"}]),
+    # a leading BOM is not document content
+    (b"\xef\xbb\xbf<feed><item><t>a</t></item></feed>", [{"t": "a"}]),
+    # CRLF is normalized (XML 1.0 §2.11)
+    (b"<feed><item><t>a\r\nb</t></item></feed>", [{"t": "a\nb"}]),
+]
+
+
+@pytest.mark.parametrize("feed,expected", DAMAGED_CASES, ids=range(len(DAMAGED_CASES)))
+def test_damaged_feeds_agree_across_engines(tmp_path, feed, expected):
+    path = _write(tmp_path, feed)
+    assert _xmlstreamer.read_xml(path, separator_tag="item").to_pylist() == expected
+    assert (
+        _xmlstreamer.read_xml_par(path, separator_tag="item", chunks=4).to_pylist()
+        == expected
+    )
+    assert [
+        row
+        for batch in _xmlstreamer.read_xml_stream(
+            path, separator_tag="item", memory="64KiB"
+        )
+        for row in batch.to_pylist()
+    ] == expected
+    assert [
+        row
+        for batch in _xmlstreamer.iter_xml_batches_par(
+            path, separator_tag="item", threads=4, memory="64KiB"
+        )
+        for row in batch.to_pylist()
+    ] == expected
+
+
+def test_doctype_ghost_at_every_chunk_count(tmp_path):
+    feed = (
+        b'<!DOCTYPE feed [<!ENTITY ghost "<item><t>x</t></item>">]>'
+        b"<feed><item><t>real</t></item></feed>"
+    )
+    path = _write(tmp_path, feed)
+    for chunks in (2, 3, 4, 8):
+        assert (
+            _xmlstreamer.read_xml_par(
+                path, separator_tag="item", chunks=chunks
+            ).to_pylist()
+            == [{"t": "real"}]
+        )
+
+
+def test_section_longer_than_skip_window_is_not_split(tmp_path):
+    feed = (
+        b"<feed><![CDATA["
+        + b"y" * 100_000
+        + b"<item><t>ghost</t></item>"
+        + b"y" * 100_000
+        + b"]]><item><t>real</t></item></feed>"
+    )
+    path = _write(tmp_path, feed)
+    assert (
+        _xmlstreamer.read_xml_par(path, separator_tag="item", chunks=4).to_pylist()
+        == [{"t": "real"}]
+    )
+    assert [
+        row
+        for batch in _xmlstreamer.iter_xml_batches_par(
+            path, separator_tag="item", threads=4, memory="1MiB"
+        )
+        for row in batch.to_pylist()
+    ] == [{"t": "real"}]
+
+
+# --- regressions: projection / validation semantics --- #
+
+
+def test_field_mapping_with_schema_keeps_the_mapped_subtree(tmp_path):
+    feed = b"<feed><item><t>a</t><n>1</n></item></feed>"
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed),
+        separator_tag="item",
+        field_mapping={"t": "title"},
+        schema=["title"],
+    )
+    assert table.to_pylist() == [{"title": "a"}]
+
+
+def test_projection_keeps_empty_rows(tmp_path):
+    feed = b"<feed><item><t>a</t></item><item><n>1</n></item></feed>"
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed), separator_tag="item", schema=["t"]
+    )
+    assert table.num_rows == 2
+    assert table.to_pylist() == [{"t": "a"}, {"t": None}]
+
+
+def test_empty_schema_means_no_projection(tmp_path):
+    feed = b"<feed><item><t>a</t></item></feed>"
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed), separator_tag="item", schema=[]
+    )
+    assert table.to_pylist() == [{"t": "a"}]
+
+
+@pytest.mark.parametrize(
+    "feed,expected",
+    [
+        # strict validation reaches into a skipped subtree
+        (b"<feed><item><t>a</t><n>&bogus;</n></item></feed>", []),
+        (b"<feed><item><t>a</t><n>\x01</n></item></feed>", []),
+        (
+            b"<feed><item><t>a</t><junk><item><t>b</t></junk></item>"
+            b"<item><t>c</t></item></feed>",
+            [{"t": "c"}],
+        ),
+    ],
+    ids=["undefined_entity", "control_char", "crossing_subtree"],
+)
+def test_strict_projection_validates_skipped_content(tmp_path, feed, expected):
+    table = _xmlstreamer.read_xml(
+        _write(tmp_path, feed), separator_tag="item", schema=["t"]
+    )
+    assert table.to_pylist() == expected
+
+
+def test_engine_and_separator_are_validated(tmp_path):
+    path = _write(tmp_path, b"<feed><item><t>x</t></item></feed>")
+    with pytest.raises(ValueError):
+        XmlSource(path, engine="bogus")
+    with pytest.raises(ValueError):
+        XmlSource(path, separator_tag="not a name")
+    with pytest.raises(ValueError):
+        _xmlstreamer.read_xml(path, separator_tag="")
+
+
+def test_source_threads_reach_the_streaming_reader(tmp_path, monkeypatch):
+    import xmlstreamer.source as source_module
+
+    feed = build_feed([{"n": str(i)} for i in range(500)])
+    path = _write(tmp_path, feed)
+    calls = []
+    real = source_module._xmlstreamer
+
+    class Spy:
+        def __getattr__(self, name):
+            def call(*args, **kwargs):
+                calls.append(name)
+                return getattr(real, name)(*args, **kwargs)
+
+            return call
+
+    monkeypatch.setattr(source_module, "_xmlstreamer", Spy())
+    rows = [
+        row
+        for batch in XmlSource(path, threads=4).iter_record_batches(memory="64KiB")
+        for row in batch.to_pylist()
+    ]
+    assert calls == ["iter_xml_batches_par"] or "iter_xml_batches_par" in calls
+    assert rows == [{"n": str(i)} for i in range(500)]
+
+
+def test_rypipe_read_stream_par_and_batches(tmp_path):
+    feed = build_feed([{"t": "a"}, {"t": "b"}])
+    path = _write(tmp_path, feed)
+    assert rypipe.read_stream(path, format="xmlstreamer", memory="1MiB").to_pylist() == [
+        {"t": "a"},
+        {"t": "b"},
+    ]
+    assert rypipe.read_par(path, format="xmlstreamer", chunks=2).num_rows == 2
+    batches = list(
+        rypipe.read_batches(path, format="xmlstreamer", batch_size=1)
+    )
+    assert [batch.num_rows for batch in batches] == [1, 1]
+
