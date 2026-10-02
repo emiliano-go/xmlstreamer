@@ -1122,7 +1122,6 @@ dependencies = [
  "pyo3",
  "rypipe-core",
  "rypipe-python",
- "simdutf8",
 ]
 
 [[package]]

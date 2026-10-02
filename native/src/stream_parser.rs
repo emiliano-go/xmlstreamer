@@ -20,11 +20,22 @@ pub struct StreamRecord {
 
 /// Format bytes the way Python's `repr(bytes)` does for the scanner warnings.
 fn bytes_repr(bytes: &[u8]) -> String {
-    let mut out = String::from("b'");
+    // Python picks double quotes when the payload has a single quote but no
+    // double quote; otherwise single quotes with escapes.
+    let quote = if bytes.contains(&b'\'') && !bytes.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut out = String::from("b");
+    out.push(quote as char);
     for &b in bytes {
         match b {
-            b'\'' => out.push_str("\\'"),
             b'\\' => out.push_str("\\\\"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c as char);
+            }
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
@@ -32,7 +43,7 @@ fn bytes_repr(bytes: &[u8]) -> String {
             _ => out.push_str(&format!("\\x{b:02x}")),
         }
     }
-    out.push('\'');
+    out.push(quote as char);
     out
 }
 
@@ -74,7 +85,7 @@ fn report(log: Log, diag: &dyn ParseDiagnostics) {
         Log::SectionEof { opener, discarded } => diag.warning(
             "section_eof",
             &format!(
-                "Feed ended inside {} that never closed: {} bytes discarded.",
+                "Feed ended inside bytearray({}) that never closed: {} bytes discarded.",
                 bytes_repr(&opener),
                 discarded
             ),

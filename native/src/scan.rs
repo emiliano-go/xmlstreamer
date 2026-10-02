@@ -158,7 +158,14 @@ pub fn find_open_sep(bytes: &[u8], from: usize, sep: &[u8]) -> Option<(usize, us
             let q = p + 1 + sep.len();
             match bytes.get(q) {
                 Some(b'>') => return Some((p, q + 1)),
-                Some(&b) if is_ws(b) => return find_tag_end(bytes, q).map(|end| (p, end)),
+                Some(&b) if is_ws(b) => {
+                    if let Some(end) = find_tag_end(bytes, q) {
+                        return Some((p, end));
+                    }
+                    // The opening tag never closes: a malformed delimiter,
+                    // not a boundary. Resync the way the streaming scanner
+                    // does and keep looking for the next one.
+                }
                 _ => {}
             }
         }

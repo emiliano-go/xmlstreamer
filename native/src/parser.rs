@@ -40,9 +40,31 @@ pub fn field_kinds(types: Option<HashMap<String, String>>) -> HashMap<String, Fi
         .collect()
 }
 
-/// The declared projection as a lookup set (schema_order), or None.
-pub fn keep_set(schema: Option<&Vec<String>>) -> Option<HashSet<String>> {
-    schema.map(|names| names.iter().cloned().collect())
+/// The declared projection as a lookup set of *source* tag names, or None.
+///
+/// `schema` names are output names after `field_mapping`, so each one is
+/// mapped back to the raw tag it renames; otherwise a mapped subtree would
+/// look unwanted and be skipped whole.
+pub fn keep_set(
+    schema: Option<&Vec<String>>,
+    field_mapping: Option<&HashMap<String, String>>,
+) -> Option<HashSet<String>> {
+    let names = schema?;
+    if names.is_empty() {
+        return None;
+    }
+    let mut set: HashSet<String> = HashSet::with_capacity(names.len());
+    for out_name in names {
+        if let Some(mapping) = field_mapping {
+            if let Some((raw, _)) = mapping.iter().find(|(_, renamed)| *renamed == out_name)
+            {
+                set.insert(raw.clone());
+                continue;
+            }
+        }
+        set.insert(out_name.clone());
+    }
+    Some(set)
 }
 
 fn typed_value<'a>(kind: FieldKind, value: &'a str) -> Value<'a> {
@@ -226,8 +248,10 @@ impl XmlParser {
 }
 
 impl RecordParser for XmlParser {
-    fn validate(&self, bytes: &[u8]) -> rypipe_core::Result<()> {
-        simdutf8::basic::from_utf8(bytes).map_err(rypipe_core::Error::Utf8)?;
+    fn validate(&self, _bytes: &[u8]) -> rypipe_core::Result<()> {
+        // Invalid utf-8 is not an error: text runs replace bad sequences
+        // with U+FFFD, exactly like the streaming parser, so one broken byte
+        // costs one replacement instead of the whole read.
         Ok(())
     }
 

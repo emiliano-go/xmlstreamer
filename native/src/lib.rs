@@ -24,6 +24,17 @@ use parser::XmlParser;
 use splitter::XmlSplitter;
 use stream_parser::{StreamRecord, XmlStreamParser};
 
+/// Reject separator tags the XML name rules cannot allow, at the entry
+/// point, exactly like the Python `Tokenizer` does.
+fn validate_separator_tag(separator_tag: &str) -> PyResult<()> {
+    if !xml::is_xml_name(separator_tag.as_bytes()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "separator_tag {separator_tag:?} is not a name an XML tag can have"
+        )));
+    }
+    Ok(())
+}
+
 /// Parse a memory string ("64MiB", "1GB") or an int into bytes.
 fn memory_bytes(value: &Bound<'_, PyAny>) -> PyResult<usize> {
     if let Ok(bytes) = value.extract::<usize>() {
@@ -263,7 +274,8 @@ fn read_xml(
     prefault: bool,
     validate: &str,
 ) -> PyResult<Py<PyAny>> {
-    let keep = parser::keep_set(schema.as_ref());
+    validate_separator_tag(&separator_tag)?;
+    let keep = parser::keep_set(schema.as_ref(), field_mapping.as_ref());
     let strict = match validate {
         "strict" => true,
         "fast" => false,
@@ -330,7 +342,8 @@ fn read_xml_par(
     prefault: bool,
     validate: &str,
 ) -> PyResult<Py<PyAny>> {
-    let keep = parser::keep_set(schema.as_ref());
+    validate_separator_tag(&separator_tag)?;
+    let keep = parser::keep_set(schema.as_ref(), field_mapping.as_ref());
     let strict = match validate {
         "strict" => true,
         "fast" => false,
@@ -403,7 +416,8 @@ fn read_xml_stream(
         Some(value) => MemoryBudget::new(memory_bytes(&value)?),
         None => MemoryBudget::new(64 * 1024 * 1024),
     };
-    let keep = parser::keep_set(schema.as_ref());
+    validate_separator_tag(&separator_tag)?;
+    let keep = parser::keep_set(schema.as_ref(), field_mapping.as_ref());
     let strict = match validate {
         "strict" => true,
         "fast" => false,
@@ -513,7 +527,8 @@ fn iter_xml_batches_par(
         Some(value) => MemoryBudget::new(memory_bytes(&value)?),
         None => MemoryBudget::new(64 * 1024 * 1024),
     };
-    let keep = parser::keep_set(schema.as_ref());
+    validate_separator_tag(&separator_tag)?;
+    let keep = parser::keep_set(schema.as_ref(), field_mapping.as_ref());
     let strict = match validate {
         "strict" => true,
         "fast" => false,

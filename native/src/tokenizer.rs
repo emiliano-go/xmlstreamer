@@ -118,8 +118,11 @@ impl Engine {
         on_limit_text: bool,
         deadline_secs: Option<f64>,
     ) -> Self {
-        let deadline = deadline_secs
-            .map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s.max(0.0)));
+        let deadline = deadline_secs.and_then(|s| {
+            let secs = if s.is_nan() { 0.0 } else { s.clamp(0.0, 1.0e9) };
+            std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs_f64(secs))
+        });
         Engine {
             sep: separator_tag.as_bytes().to_vec(),
             buffer: Vec::new(),
@@ -165,6 +168,7 @@ impl Engine {
     pub fn malformed_tags(&self) -> usize {
         self.malformed_tags
     }
+
 
     pub fn take_logs(&mut self) -> Vec<Log> {
         std::mem::take(&mut self.logs)
@@ -642,20 +646,64 @@ impl Engine {
     }
 
     fn pending_tag_tail(&mut self, floor: usize) -> usize {
-        let idx = match memchr::memrchr(b'<', &self.buffer[floor..]) {
-            Some(r) => floor + r,
-            None => return self.buffer.len(),
-        };
-        if self.tag_open_at != idx as i64 {
-            self.tag_open_at = idx as i64;
-            self.tag_scan = idx + 1;
-            self.tag_quote = 0;
+        // Keep the earliest suffix that can still grow into a separator open
+        // tag, a separator close tag or a markup section. Anchoring on the
+        // last `<` is unsafe: it may sit inside a quoted attribute value (or
+        // inside a section opener like `<!--`), and its quote state would
+        // then swallow the rest of the feed at some chunk sizes.
+        let mut p = floor;
+        while let Some(r) = memchr::memchr(b'<', &self.buffer[p..]) {
+            let idx = p + r;
+            match self.classify_section(idx) {
+                Classify::NeedMore | Classify::Section { .. } => {
+                    // A complete or growable section opener: leave it to
+                    // classify_section on the next pass, never to the tag
+                    // walk.
+                    self.tag_open_at = -1;
+                    return idx;
+                }
+                Classify::None => {}
+            }
+            let tail = &self.buffer[idx + 1..];
+            let open_prefix = self.sep.starts_with(tail);
+            let open_tag = !open_prefix
+                && tail.len() > self.sep.len()
+                && tail.starts_with(&self.sep)
+                && matches!(tail[self.sep.len()], b'>' | b' ' | b'\t' | b'\r' | b'\n');
+            let after_slash = tail.strip_prefix(b"/");
+            let close_candidate = match after_slash {
+                // `</`, `</i`, `</item`, `</item>` or `</item ...`: either a
+                // partial name or a name that already matches lexically and
+                // still needs its `>`.
+                Some(rest) => {
+                    self.sep.starts_with(rest)
+                        || (rest.len() > self.sep.len()
+                            && rest.starts_with(&self.sep)
+                            && (rest[self.sep.len()] == b'>'
+                                || is_ws(rest[self.sep.len()])))
+                }
+                None => false,
+            };
+            if open_prefix || open_tag {
+                if self.tag_open_at != idx as i64 {
+                    self.tag_open_at = idx as i64;
+                    self.tag_scan = idx + 1;
+                    self.tag_quote = 0;
+                }
+                if self.resume_tag_scan() == -1 {
+                    return idx;
+                }
+                // The tag completed and is not our separator: keep looking.
+                self.tag_open_at = -1;
+            } else if close_candidate {
+                // A closing tag has no quoted attributes to resume; keep the
+                // marker for the close search on the next pass.
+                self.tag_open_at = -1;
+                return idx;
+            }
+            p = idx + 1;
         }
-        if self.resume_tag_scan() != -1 {
-            self.tag_open_at = -1;
-            return self.buffer.len();
-        }
-        idx
+        self.buffer.len()
     }
 
     fn check_delimiter(&mut self, tag: &[u8], shape: fn(&[u8]) -> bool) {

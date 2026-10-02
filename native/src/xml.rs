@@ -15,7 +15,7 @@ const NAME_STOP: [u8; 10] = [
 // ---------------------------------------------------------------------------
 
 fn is_name_start_char(c: char) -> bool {
-    c == ':' || c == '_' || c.is_alphabetic()
+    c == ':' || c == '_' || c.is_ascii_alphabetic()
         || ('\u{00C0}'..='\u{00D6}').contains(&c)
         || ('\u{00D8}'..='\u{00F6}').contains(&c)
         || ('\u{00F8}'..='\u{02FF}').contains(&c)
@@ -33,7 +33,6 @@ fn is_name_start_char(c: char) -> bool {
 fn is_name_char(c: char) -> bool {
     is_name_start_char(c)
         || c.is_ascii_digit()
-        || c.is_numeric()
         || c == '-'
         || c == '.'
         || c == '\u{00B7}'
@@ -141,7 +140,9 @@ pub fn attvalue_is_well_formed(value: &[u8]) -> bool {
             if !is_xml_char(char_ref_code(&body[1..], 10)) {
                 return false;
             }
-        } else if !is_xml_name(body.as_bytes()) {
+        } else if !matches!(body, "amp" | "lt" | "gt" | "quot" | "apos") {
+            // Entity declarations are rejected, so only the five predefined
+            // entities can ever resolve; expat rejects the rest.
             return false;
         }
         pos = semi + 1;
@@ -320,7 +321,8 @@ fn err() -> DocResult {
 /// Parse a whole item document (wrapper included) into flat fields.
 pub fn parse_document(doc: &[u8]) -> DocResult {
     let n = doc.len();
-    let mut i = 0usize;
+    // A leading byte-order mark is not part of the document.
+    let mut i = if doc.starts_with(b"\xef\xbb\xbf") { 3 } else { 0 };
     let mut stack: Vec<Frame> = Vec::new();
     let mut sink = Sink::default();
     let mut root_closed = false;
@@ -355,6 +357,9 @@ pub fn parse_document(doc: &[u8]) -> DocResult {
         if doc[i..].starts_with(b"<!--") {
             match find_seq(doc, i + 4, b"-->") {
                 Some(end) => {
+                    if !comment_is_well_formed(&doc[i + 4..end]) {
+                        return err();
+                    }
                     i = end + 3;
                     continue;
                 }
@@ -375,7 +380,10 @@ pub fn parse_document(doc: &[u8]) -> DocResult {
                     if has_forbidden_char(text) {
                         return err();
                     }
-                    stack.last_mut().unwrap().text.push_str(text);
+                    push_normalized(
+                        &mut stack.last_mut().unwrap().text,
+                        text,
+                    );
                     i = end + 3;
                     continue;
                 }
@@ -385,6 +393,9 @@ pub fn parse_document(doc: &[u8]) -> DocResult {
         if doc[i..].starts_with(b"<?") {
             match find_seq(doc, i + 2, b"?>") {
                 Some(end) => {
+                    if pi_end(doc, i).is_none() {
+                        return err();
+                    }
                     i = end + 2;
                     continue;
                 }
@@ -549,6 +560,19 @@ fn start_tag_name(tag: &[u8]) -> Option<&[u8]> {
     Some(&tag[1..pos as usize])
 }
 
+/// The tag name starting at `start`, or `None` when it is not a valid name.
+fn tag_name_at(tag: &[u8], start: usize) -> Option<&[u8]> {
+    if tag.len() < start + 2 {
+        return None;
+    }
+    let end = tag.len() - 1;
+    let pos = name_end(tag, start, end);
+    if pos == -1 {
+        return None;
+    }
+    Some(&tag[start..pos as usize])
+}
+
 fn end_tag_name(tag: &[u8]) -> &[u8] {
     let end = tag.len() - 1;
     let pos = name_end(tag, 2, end);
@@ -616,6 +640,72 @@ fn scan_doctype(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// XML 1.0 §2.11: literal `\r\n` and `\r` normalize to `\n`. Character
+/// references are exempt, so this applies to raw text runs only.
+fn push_normalized(out: &mut String, raw: &str) {
+    if !raw.contains('\r') {
+        out.push_str(raw);
+        return;
+    }
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// A comment body may not contain `--` nor end with `-` (XML 1.0 §2.5).
+fn comment_is_well_formed(body: &[u8]) -> bool {
+    memchr::memmem::find(body, b"--").is_none() && !body.ends_with(b"-")
+}
+
+/// End of a processing instruction starting at `start` (its `<`), or `None`
+/// when the target is not a name other than `xml`.
+fn pi_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let n = bytes.len();
+    let mut i = start + 2;
+    let name_start = i;
+    while i < n && !NAME_STOP.contains(&bytes[i]) && bytes[i] != b'?' {
+        i += 1;
+    }
+    if i == name_start || !is_xml_name(&bytes[name_start..i]) {
+        return None;
+    }
+    if bytes[name_start..i].eq_ignore_ascii_case(b"xml") {
+        return None;
+    }
+    if i < n && bytes[i] != b'?' && !XML_WHITESPACE.contains(&bytes[i]) {
+        return None;
+    }
+    find_seq(bytes, i, b"?>").map(|end| end + 2)
+}
+
+/// The item's close tag is located lexically: `</sep>` or `</sep junk>` end
+/// the item even when the tag itself is malformed, matching the scanner.
+fn closes_separator(tag: &[u8], sep: &[u8]) -> Option<usize> {
+    if !tag.starts_with(b"</") {
+        return None;
+    }
+    let name = match tag_name_at(tag, 2) {
+        Some(name) => name,
+        None => return None,
+    };
+    if name != sep {
+        return None;
+    }
+    match tag.get(2 + sep.len()) {
+        Some(b'>') => Some(3 + sep.len()),
+        Some(&b) if crate::scan::is_ws(b) => Some(tag.len()),
+        _ => None,
+    }
+}
+
 /// Decode a run of character data up to the next `<`.
 fn decode_text(bytes: &[u8], start: usize) -> Option<(String, usize)> {
     let n = bytes.len();
@@ -632,11 +722,15 @@ fn decode_text(bytes: &[u8], start: usize) -> Option<(String, usize)> {
         while i < n && bytes[i] != b'<' && bytes[i] != b'&' {
             i += 1;
         }
-        let run = std::str::from_utf8(&bytes[run_start..i]).ok()?;
+        let raw = &bytes[run_start..i];
+        if memchr::memmem::find(raw, b"]]>").is_some() {
+            return None;
+        }
+        let run = std::str::from_utf8(raw).ok()?;
         if has_forbidden_char(run) {
             return None;
         }
-        out.push_str(run);
+        push_normalized(&mut out, run);
     }
     Some((out, i))
 }
@@ -909,13 +1003,96 @@ fn read_text_run(
         while i < n && content[i] != b'<' && content[i] != b'&' {
             i += 1;
         }
-        let run = std::str::from_utf8(&content[start..i]).ok()?;
-        if strict && has_forbidden_char(run) {
+        let raw = &content[start..i];
+        if memchr::memmem::find(raw, b"]]>").is_some() {
             return None;
         }
-        target.push_run(content, start, i);
+        match std::str::from_utf8(raw) {
+            Ok(run) => {
+                if strict && has_forbidden_char(run) {
+                    return None;
+                }
+                if run.contains('\r') {
+                    let mut normalized = String::with_capacity(run.len());
+                    push_normalized(&mut normalized, run);
+                    target.push_owned(content, normalized);
+                } else {
+                    target.push_run(content, start, i);
+                }
+            }
+            Err(_) => {
+                // Invalid utf-8 is replaced, exactly like the streaming
+                // parser: a broken byte drops nothing.
+                let run = String::from_utf8_lossy(raw);
+                if strict && has_forbidden_char(&run) {
+                    return None;
+                }
+                let mut normalized = String::with_capacity(run.len());
+                push_normalized(&mut normalized, &run);
+                target.push_owned(content, normalized);
+            }
+        }
     }
     Some(i)
+}
+
+/// Skip an unwanted depth-1 subtree, returning the index just past its
+/// matching end tag. Strict mode validates every tag, attribute and text run
+/// inside it; fast mode skips lexically (the caller opted out of validation).
+fn skip_subtree_checked(
+    bytes: &[u8],
+    after_open: usize,
+    name: &[u8],
+    strict: bool,
+) -> Option<usize> {
+    if !strict {
+        return crate::scan::skip_element(bytes, after_open, name);
+    }
+    let n = bytes.len();
+    let mut stack: Vec<&[u8]> = vec![name];
+    let mut i = after_open;
+    while i < n {
+        if bytes[i] != b'<' {
+            let mut scratch = TextBuf::default();
+            i = read_text_run(bytes, i, true, &mut scratch)?;
+            continue;
+        }
+        if bytes[i..].starts_with(b"<!DOCTYPE") {
+            return None;
+        }
+        match crate::scan::section_end(bytes, i) {
+            crate::scan::Section::End(end) => {
+                i = end;
+                continue;
+            }
+            crate::scan::Section::Unterminated => return None,
+            crate::scan::Section::No => {}
+        }
+        let end = find_tag_end(bytes, i + 1)?;
+        let tag = &bytes[i..end];
+        if tag.starts_with(b"</") {
+            if !end_tag_is_well_formed(tag) {
+                return None;
+            }
+            let close = end_tag_name(tag);
+            if stack.pop()? != close {
+                return None;
+            }
+            if stack.is_empty() {
+                return Some(end);
+            }
+        } else {
+            if !start_tag_is_well_formed(tag) {
+                return None;
+            }
+            let raw = start_tag_name(tag)?;
+            if !is_self_closing(tag) {
+                stack.push(raw);
+            }
+        }
+        i = end;
+    }
+    None
 }
 
 /// Result of parsing one item in place (fused scan + parse).
@@ -968,10 +1145,14 @@ pub fn parse_item_fused<E: FlatEmitter>(
         }
 
         if bytes[i..].starts_with(b"<!--") {
-            i = match find_seq(bytes, i + 4, b"-->") {
-                Some(end) => end + 3,
+            let end = match find_seq(bytes, i + 4, b"-->") {
+                Some(end) => end,
                 None => return Fused::Incomplete,
             };
+            if !comment_is_well_formed(&bytes[i + 4..end]) {
+                return Fused::Malformed;
+            }
+            i = end + 3;
             continue;
         }
         if bytes[i..].starts_with(b"<![CDATA[") {
@@ -979,26 +1160,30 @@ pub fn parse_item_fused<E: FlatEmitter>(
                 Some(end) => end,
                 None => return Fused::Incomplete,
             };
-            let raw = match std::str::from_utf8(&bytes[i + 9..end]) {
-                Ok(s) => s,
-                Err(_) => return Fused::Malformed,
-            };
-            if strict && has_forbidden_char(raw) {
+            let raw = &bytes[i + 9..end];
+            let text = String::from_utf8_lossy(raw);
+            if strict && has_forbidden_char(&text) {
                 return Fused::Malformed;
             }
             let target = match scratch.stack.last_mut() {
                 Some(frame) => &mut frame.text,
                 None => &mut root,
             };
-            target.push_run(bytes, i + 9, end);
+            let mut normalized = String::with_capacity(text.len());
+            push_normalized(&mut normalized, &text);
+            target.push_owned(bytes, normalized);
             i = end + 3;
             continue;
         }
         if bytes[i..].starts_with(b"<?") {
-            i = match find_seq(bytes, i + 2, b"?>") {
-                Some(end) => end + 2,
+            let end = match find_seq(bytes, i + 2, b"?>") {
+                Some(end) => end,
                 None => return Fused::Incomplete,
             };
+            if pi_end(bytes, i).is_none() {
+                return Fused::Malformed;
+            }
+            i = end + 2;
             continue;
         }
         if bytes[i..].starts_with(b"<!") {
@@ -1011,17 +1196,18 @@ pub fn parse_item_fused<E: FlatEmitter>(
                 None => return Fused::Incomplete,
             };
             let tag = &bytes[i..end];
+            if scratch.stack.is_empty() {
+                // The delimiter is located lexically: junk in the closing
+                // tag still ends the item, whose content was parsed above.
+                if closes_separator(tag, sep.as_bytes()).is_none() {
+                    return Fused::Malformed;
+                }
+                return finish_item(scratch, bytes, sep, &mut root, seen_child, emitter, end);
+            }
             if !end_tag_is_well_formed(tag) {
                 return Fused::Malformed;
             }
             let name = end_tag_name(tag);
-            if scratch.stack.is_empty() {
-                if name != sep.as_bytes() {
-                    return Fused::Malformed;
-                }
-                i = end;
-                return finish_item(scratch, bytes, sep, &mut root, seen_child, emitter, i);
-            }
             let frame = scratch.stack.pop().unwrap();
             if name != &bytes[frame.tag.0..frame.tag.1] {
                 return Fused::Malformed;
@@ -1063,9 +1249,11 @@ pub fn parse_item_fused<E: FlatEmitter>(
         let tag_span = (i + 1, i + 1 + name.len());
         let self_closing = is_self_closing(tag);
 
-        // Projection pushdown: a depth-1, first-occurrence, pure-text leaf
-        // whose column is unwanted is skipped without scanning its value;
-        // numbering state is kept so later siblings number as before.
+        // Projection pushdown: a depth-1, first-occurrence, unwanted text
+        // leaf is skipped without scanning its value; numbering state is
+        // kept so later siblings number as before. Strict mode only skips an
+        // empty leaf, so no unvalidated content can slip through; fast mode
+        // (the caller opted out of validation) skips any leaf.
         if scratch.stack.is_empty() && !self_closing && !emitter.wants(name) {
             let path = KeySrc::Content(tag_span.0, tag_span.1);
             let first = !scratch
@@ -1080,12 +1268,14 @@ pub fn parse_item_fused<E: FlatEmitter>(
                 if let Some(lt) = rypipe_core::scan::find(bytes, end, b'<') {
                     let after = lt + 2;
                     let tag_bytes = &bytes[tag_span.0..tag_span.1];
-                    if bytes.get(lt..lt + 2) == Some(b"</")
+                    if (!strict || lt == end)
+                        && bytes.get(lt..lt + 2) == Some(b"</")
                         && after + tag_bytes.len() + 1 <= n
                         && &bytes[after..after + tag_bytes.len()] == tag_bytes
                         && bytes[after + tag_bytes.len()] == b'>'
                     {
                         scratch.appearances.push((path, 0));
+                        seen_child = true;
                         i = after + tag_bytes.len() + 1;
                         continue;
                     }
@@ -1094,18 +1284,20 @@ pub fn parse_item_fused<E: FlatEmitter>(
         }
 
         // Projection pushdown: under a declared schema, a depth-1 subtree with
-        // no wanted descendant is skipped whole.
+        // no wanted descendant is skipped whole. Strict mode still validates
+        // everything inside it, so a malformed item can never slip through.
         if scratch.stack.is_empty() && !self_closing {
             if let Some(keep) = keep {
                 if !subtree_wanted(keep, name) {
                     if let Some(after) =
-                        crate::scan::skip_element(bytes, end, name.as_bytes())
+                        skip_subtree_checked(bytes, end, name.as_bytes(), strict)
                     {
                         let _ = number_key(
                             scratch,
                             bytes,
                             KeySrc::Content(tag_span.0, tag_span.1),
                         );
+                        seen_child = true;
                         i = after;
                         continue;
                     }
@@ -1170,6 +1362,10 @@ fn finish_item<E: FlatEmitter>(
     }
 
     if scratch.pending.is_empty() {
+        // The item had children but every emitted field was projected out:
+        // the record still exists (with nulls), matching rypipe semantics.
+        emitter.row_start();
+        emitter.row_end();
         return Fused::Complete { resume };
     }
     if scratch.pending.len() == 1 {
