@@ -124,6 +124,8 @@ def is_valid_xml_name(name: str) -> bool:
     Whether a tag can be called this, decided by the same XML name rules
     the engine uses.
     """
+    if not isinstance(name, str):
+        return False
     try:
         return _xmlstreamer.is_xml_name(name.encode("utf-8"))
     except UnicodeEncodeError:
@@ -1180,12 +1182,21 @@ class Tokenizer:
                 return None
 
             if code == 1:  # the engine needs more bytes
-                try:
-                    chunk = next(self.feed_generator)
-                except StopIteration:
-                    self._engine.finish()
-                else:
+                # Read ahead like the historical tokenizer: hand over at
+                # least one chunk and keep going until buffer_size bytes have
+                # been fed, so a small generator chunk never changes what
+                # comes out.
+                fed = 0
+                first = True
+                while first or fed < self.buffer_size:
+                    first = False
+                    try:
+                        chunk = next(self.feed_generator)
+                    except StopIteration:
+                        self._engine.finish()
+                        break
                     self._engine.feed(chunk)
+                    fed += len(chunk)
                 continue
 
             content, parsed, replaced, collisions = payload
@@ -1197,10 +1208,12 @@ class Tokenizer:
                     taken, tag, key,
                 )
             if parsed is None:
+                wrapper = f"<{self.separator_tag}>".encode()
+                closing = f"</{self.separator_tag}>".encode()
                 logger.warning(
                     "Discarding unparseable item (%s): %r",
                     "malformed XML",
-                    bytes(content[:120]),
+                    (wrapper + bytes(content) + closing)[:120],
                 )
             self.actual_item = ParsedItem(
                 content=bytes(content),
